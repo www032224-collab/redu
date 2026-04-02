@@ -1,0 +1,5 @@
+yt-dlp
+highrise-bot-sdk
+aiohttp
+websockets
+requests

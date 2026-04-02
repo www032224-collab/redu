@@ -104,6 +104,17 @@ AUTOPLAY_FILE = "autoplay.json"
 FFMPEG        = shutil.which("ffmpeg") or "ffmpeg"
 
 # ════════════════════════════════════════════════════
+#  Logging — يجب أن يكون قبل GitHubStorage
+# ════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S")
+for _noisy in ("aiohttp", "asyncio", "concurrent", "urllib3", "aiohttp.access"):
+    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+log = logging.getLogger("Radio")
+
+# ════════════════════════════════════════════════════
 #  🗄️  GitHub Storage — قلب نظام الحفظ المجاني
 #  يقرأ ويكتب JSON مباشرة على GitHub
 #  كل عملية حفظ تصير في الخلفية — لا تأخير للمستخدم
@@ -218,16 +229,7 @@ class GitHubStorage:
 
 GH = GitHubStorage()
 
-# ════════════════════════════════════════════════════
-#  Logging
-# ════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S")
-for _noisy in ("aiohttp", "asyncio", "concurrent", "urllib3", "aiohttp.access"):
-    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
-log = logging.getLogger("Radio")
+
 
 _EXEC = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ytdlp")
 

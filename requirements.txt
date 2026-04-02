@@ -3,3 +3,5 @@ highrise-bot-sdk
 aiohttp
 websockets
 requests
+flask
+setuptools

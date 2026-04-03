@@ -416,13 +416,11 @@ def fetch_song(query: str) -> Optional[Song]:
         "quiet":          True,
         "no_warnings":    True,
         "noplaylist":     True,
-        "format":         "bestaudio[protocol=https][ext=mp3]/bestaudio[protocol=https][ext=m4a]/bestaudio[protocol=https]/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio",
+        "format":         "bestaudio/best",
         "skip_download":  True,
         "socket_timeout": 20,
         "retries":        3,
-        "extractor_args": {
-            "soundcloud": {"formats": ["http_mp3_128_url"]},
-        },
+
     }
 
     SOURCES = [
@@ -736,22 +734,42 @@ class Broadcaster:
     def _stream(self, song: Song):
         log.info("📡 بث: %s", song.title)
         RING.sync_all()
-        cmd = [
-            FFMPEG,
-            "-reconnect", "1", "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "3",
-            "-timeout", "10000000",
-            "-i", song.url,
-            "-vn",
-            "-acodec",    "libmp3lame",
-            "-ab",        "128k",
-            "-ar",        "44100",
-            "-ac",        "2",
-            "-reservoir", "0",
-            "-f",         "mp3",
-            "-loglevel",  "error",
-            "pipe:1",
-        ]
+
+        # نحدد نوع الرابط — HLS يحتاج معاملة خاصة
+        is_hls = "m3u8" in song.url or ".m3u8" in song.url or "hls" in song.url.lower()
+
+        if is_hls:
+            # رابط HLS — نستخدم yt-dlp لتحميله أولاً ثم نبثه
+            cmd = [
+                FFMPEG,
+                "-loglevel", "error",
+                "-i", song.url,
+                "-vn",
+                "-acodec", "libmp3lame",
+                "-ab", "128k",
+                "-ar", "44100",
+                "-ac", "2",
+                "-reservoir", "0",
+                "-f", "mp3",
+                "pipe:1",
+            ]
+        else:
+            cmd = [
+                FFMPEG,
+                "-reconnect", "1", "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "3",
+                "-timeout", "10000000",
+                "-i", song.url,
+                "-vn",
+                "-acodec",    "libmp3lame",
+                "-ab",        "128k",
+                "-ar",        "44100",
+                "-ac",        "2",
+                "-reservoir", "0",
+                "-f",         "mp3",
+                "-loglevel",  "error",
+                "pipe:1",
+            ]
         try:
             self._proc = subprocess.Popen(
                 cmd,

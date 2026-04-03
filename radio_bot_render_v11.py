@@ -104,17 +104,6 @@ AUTOPLAY_FILE = "autoplay.json"
 FFMPEG        = shutil.which("ffmpeg") or "ffmpeg"
 
 # ════════════════════════════════════════════════════
-#  Logging — يجب أن يكون قبل GitHubStorage
-# ════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S")
-for _noisy in ("aiohttp", "asyncio", "concurrent", "urllib3", "aiohttp.access"):
-    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
-log = logging.getLogger("Radio")
-
-# ════════════════════════════════════════════════════
 #  🗄️  GitHub Storage — قلب نظام الحفظ المجاني
 #  يقرأ ويكتب JSON مباشرة على GitHub
 #  كل عملية حفظ تصير في الخلفية — لا تأخير للمستخدم
@@ -238,6 +227,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S")
 for _noisy in ("aiohttp", "asyncio", "concurrent", "urllib3", "aiohttp.access"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+log = logging.getLogger("Radio")
 
 _EXEC = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ytdlp")
 
@@ -409,28 +399,21 @@ CACHE = SongCache(CACHE_MAX)
 def fetch_song(query: str) -> Optional[Song]:
     import yt_dlp as ytdl
 
-    import yt_dlp as ytdl
-
-    # نجبر yt-dlp على اختيار رابط مباشر بدون HLS
-    base_opts = {
+    opts = {
         "quiet":          True,
         "no_warnings":    True,
         "noplaylist":     True,
-        "format":         "bestaudio/best",
+        "format":         "http_mp3_128_url/http_aac_128_url/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio",
         "skip_download":  True,
         "socket_timeout": 20,
         "retries":        3,
-
     }
 
-    SOURCES = [
-        f"scsearch1:{query}",
-        f"ytsearch1:{query}",
-    ]
-
-    for source in SOURCES:
+    # SoundCloud أولاً لأنه لا يحتاج تسجيل دخول
+    # YouTube احتياطي
+    for source in [f"scsearch1:{query}", f"ytsearch1:{query}"]:
         try:
-            with ytdl.YoutubeDL(base_opts) as ydl:
+            with ytdl.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(source, download=False)
                 if not info or not info.get("entries"):
                     continue
@@ -455,7 +438,7 @@ def fetch_song(query: str) -> Optional[Song]:
                 return song
         except Exception as e:
             err = str(e)
-            if "Sign in" in err or "bot" in err.lower():
+            if "Sign in" in err or "bot" in err.lower() or "No video formats" in err:
                 log.warning("⚠️ %s محجوب — تجربة المصدر التالي...", source.split(":")[0])
                 continue
             log.error("fetch_song خطأ (%s): %s", source.split(":")[0], e)
@@ -734,42 +717,22 @@ class Broadcaster:
     def _stream(self, song: Song):
         log.info("📡 بث: %s", song.title)
         RING.sync_all()
-
-        # نحدد نوع الرابط — HLS يحتاج معاملة خاصة
-        is_hls = "m3u8" in song.url or ".m3u8" in song.url or "hls" in song.url.lower()
-
-        if is_hls:
-            # رابط HLS — نستخدم yt-dlp لتحميله أولاً ثم نبثه
-            cmd = [
-                FFMPEG,
-                "-loglevel", "error",
-                "-i", song.url,
-                "-vn",
-                "-acodec", "libmp3lame",
-                "-ab", "128k",
-                "-ar", "44100",
-                "-ac", "2",
-                "-reservoir", "0",
-                "-f", "mp3",
-                "pipe:1",
-            ]
-        else:
-            cmd = [
-                FFMPEG,
-                "-reconnect", "1", "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "3",
-                "-timeout", "10000000",
-                "-i", song.url,
-                "-vn",
-                "-acodec",    "libmp3lame",
-                "-ab",        "128k",
-                "-ar",        "44100",
-                "-ac",        "2",
-                "-reservoir", "0",
-                "-f",         "mp3",
-                "-loglevel",  "error",
-                "pipe:1",
-            ]
+        cmd = [
+            FFMPEG,
+            "-reconnect", "1", "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "3",
+            "-timeout", "10000000",
+            "-i", song.url,
+            "-vn",
+            "-acodec",    "libmp3lame",
+            "-ab",        "128k",
+            "-ar",        "44100",
+            "-ac",        "2",
+            "-reservoir", "0",
+            "-f",         "mp3",
+            "-loglevel",  "error",
+            "pipe:1",
+        ]
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -1137,18 +1100,13 @@ class RadioBot(BaseBot):
         if self._watchdog and not self._watchdog.done():
             self._watchdog.cancel()
         self._watchdog = asyncio.create_task(self._watchdog_loop())
-        # heartbeat — يبقي اتصال Highrise حياً
-        asyncio.create_task(self._heartbeat())
 
         if QUEUE.empty():
             nxt = AUTOPLAY.next_song()
             if nxt: QUEUE.add(nxt, "🤖 تلقائي")
 
         await self._chat("🎙️ Radio v10 جاهز على Render! ▶️")
-        # انتظر 3 ثوانٍ حتى يستقر اتصال Highrise قبل تشغيل الأغاني
-        await asyncio.sleep(3)
-        if self._connected:
-            self._task = asyncio.create_task(self._run_queue())
+        self._task = asyncio.create_task(self._run_queue())
 
     async def on_chat(self, user: User, message: str):
         msg    = message.strip()
@@ -1371,11 +1329,42 @@ class RadioBot(BaseBot):
                         BROADCAST.skip()
                         break
 
-                # إذا انتهت الأغنية بسرعة → تخطى بدون إعادة محاولة
+                # إذا انتهت الأغنية بسرعة → أعد المحاولة مرة
                 elapsed = STATE.elapsed_s()
                 if elapsed < 5 and not _skip_ev.is_set():
-                    log.warning("⚠️ أغنية قصيرة (%ds) — تخطي: %s", elapsed, req.query)
-                    CACHE.invalidate(req.query)
+                    log.warning("⚠️ أغنية قصيرة (%ds) — إعادة جلب: %s", elapsed, req.query)
+                    await asyncio.sleep(2)
+                    try:
+                        import yt_dlp as ytdl
+                        opts = {
+                            "quiet": True, "no_warnings": True, "noplaylist": True,
+                            "format": "bestaudio[ext=m4a]/bestaudio/best",
+                            "skip_download": True, "socket_timeout": 20, "retries": 3,
+                            "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
+                        }
+                        with ytdl.YoutubeDL(opts) as ydl:
+                            info2 = ydl.extract_info(f"ytsearch1:{req.query}", download=False)
+                            if info2 and info2.get("entries") and info2["entries"][0]:
+                                e2   = info2["entries"][0]
+                                url2 = e2.get("url", "")
+                                if url2:
+                                    song2 = Song(
+                                        query=req.query,
+                                        title=str(e2.get("title", req.query))[:100],
+                                        url=url2, duration=int(e2.get("duration") or 0),
+                                        by=req.by)
+                                    STATE.set(song2); _done_ev.clear()
+                                    BROADCAST.play(song2)
+                                    max_w2 = (song2.duration if song2.duration > 0 else 7200) + 180
+                                    w2 = 0
+                                    while not _done_ev.is_set() and self._connected:
+                                        await asyncio.sleep(1)
+                                        STATE.tick(); w2 += 1
+                                        if w2 > max_w2: BROADCAST.skip(); break
+                                    STATE.add_history(song2); STATE.set(None)
+                                    await asyncio.sleep(0.2); continue
+                    except Exception as retry_err:
+                        log.error("إعادة فشلت: %s", retry_err)
 
                 STATE.add_history(song); STATE.set(None)
                 await asyncio.sleep(0.2)
@@ -1393,22 +1382,6 @@ class RadioBot(BaseBot):
             log.exception("_run_queue خطأ: %s", e)
         finally:
             self._playing = False
-
-    async def _heartbeat(self):
-        """يرسل طلباً لـ Highrise كل 30 ثانية لإبقاء الاتصال حياً"""
-        while self._connected:
-            try:
-                await asyncio.sleep(30)
-                if self._connected:
-                    # نجلب قائمة المستخدمين كـ heartbeat خفيف
-                    await self.highrise.get_room_users()
-                    log.info("💓 Heartbeat OK")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.warning("💔 Heartbeat فشل: %s", e)
-                if self._connected:
-                    await asyncio.sleep(5)
 
     async def _watchdog_loop(self):
         try:

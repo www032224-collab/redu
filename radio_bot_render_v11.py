@@ -104,17 +104,6 @@ AUTOPLAY_FILE = "autoplay.json"
 FFMPEG        = shutil.which("ffmpeg") or "ffmpeg"
 
 # ════════════════════════════════════════════════════
-#  Logging — يجب أن يكون قبل GitHubStorage
-# ════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S")
-for _noisy in ("aiohttp", "asyncio", "concurrent", "urllib3", "aiohttp.access"):
-    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
-log = logging.getLogger("Radio")
-
-# ════════════════════════════════════════════════════
 #  🗄️  GitHub Storage — قلب نظام الحفظ المجاني
 #  يقرأ ويكتب JSON مباشرة على GitHub
 #  كل عملية حفظ تصير في الخلفية — لا تأخير للمستخدم
@@ -229,7 +218,16 @@ class GitHubStorage:
 
 GH = GitHubStorage()
 
-
+# ════════════════════════════════════════════════════
+#  Logging
+# ════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S")
+for _noisy in ("aiohttp", "asyncio", "concurrent", "urllib3", "aiohttp.access"):
+    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+log = logging.getLogger("Radio")
 
 _EXEC = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ytdlp")
 
@@ -399,40 +397,59 @@ CACHE = SongCache(CACHE_MAX)
 #  yt-dlp — جلب معلومات الأغنية (رابط جديد دائماً)
 # ════════════════════════════════════════════════════
 def fetch_song(query: str) -> Optional[Song]:
-    try:
-        import yt_dlp as ytdl
-        opts = {
-            "quiet":          True,
-            "no_warnings":    True,
-            "noplaylist":     True,
-            "format":         "bestaudio[ext=m4a]/bestaudio/best",
-            "skip_download":  True,
-            "socket_timeout": 20,
-            "retries":        3,
-            "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
-        }
-        with ytdl.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-            if not info or not info.get("entries"): return None
-            e = info["entries"][0]
-            if not e: return None
-            url = e.get("url", "")
-            if not url:
-                fmts = [f for f in e.get("formats", [])
-                        if f.get("acodec") != "none" and f.get("vcodec") == "none"]
-                url  = (fmts[-1] if fmts else e.get("formats", [{}])[-1]).get("url", "")
-            if not url: return None
-            song = Song(
-                query    = query,
-                title    = str(e.get("title", query))[:100],
-                url      = url,
-                duration = int(e.get("duration") or 0),
-                by       = "")
-            CACHE.put(query, song)
-            return song
-    except Exception as e:
-        log.error("fetch_song خطأ: %s", e)
-        return None
+    import yt_dlp as ytdl
+
+    # مصادر البحث بالترتيب — SoundCloud أولاً لأن YouTube يحجب السيرفرات
+    SOURCES = [
+        f"scsearch1:{query}",   # SoundCloud — لا يحتاج تسجيل دخول
+        f"ytsearch1:{query}",   # YouTube — احتياطي
+    ]
+
+    base_opts = {
+        "quiet":          True,
+        "no_warnings":    True,
+        "noplaylist":     True,
+        "format":         "bestaudio/best",
+        "skip_download":  True,
+        "socket_timeout": 20,
+        "retries":        3,
+    }
+
+    for source in SOURCES:
+        try:
+            with ytdl.YoutubeDL(base_opts) as ydl:
+                info = ydl.extract_info(source, download=False)
+                if not info or not info.get("entries"):
+                    continue
+                e = info["entries"][0]
+                if not e:
+                    continue
+                url = e.get("url", "")
+                if not url:
+                    fmts = [f for f in e.get("formats", [])
+                            if f.get("acodec") != "none" and f.get("vcodec") == "none"]
+                    url = (fmts[-1] if fmts else e.get("formats", [{}])[-1]).get("url", "")
+                if not url:
+                    continue
+                song = Song(
+                    query    = query,
+                    title    = str(e.get("title", query))[:100],
+                    url      = url,
+                    duration = int(e.get("duration") or 0),
+                    by       = "")
+                CACHE.put(query, song)
+                log.info("✅ وجد من %s: %s", source.split(":")[0], song.title)
+                return song
+        except Exception as e:
+            err = str(e)
+            if "Sign in" in err or "bot" in err.lower():
+                log.warning("⚠️ %s محجوب — تجربة المصدر التالي...", source.split(":")[0])
+                continue
+            log.error("fetch_song خطأ (%s): %s", source.split(":")[0], e)
+            continue
+
+    log.error("❌ فشل جلب الأغنية من كل المصادر: %s", query)
+    return None
 
 # ════════════════════════════════════════════════════
 #  مدير القائمة

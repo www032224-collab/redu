@@ -409,21 +409,26 @@ CACHE = SongCache(CACHE_MAX)
 def fetch_song(query: str) -> Optional[Song]:
     import yt_dlp as ytdl
 
-    # مصادر البحث بالترتيب — SoundCloud أولاً لأن YouTube يحجب السيرفرات
-    SOURCES = [
-        f"scsearch1:{query}",   # SoundCloud — لا يحتاج تسجيل دخول
-        f"ytsearch1:{query}",   # YouTube — احتياطي
-    ]
+    import yt_dlp as ytdl
 
+    # نجبر yt-dlp على اختيار رابط مباشر بدون HLS
     base_opts = {
         "quiet":          True,
         "no_warnings":    True,
         "noplaylist":     True,
-        "format":         "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio[protocol=https]/bestaudio/best",
+        "format":         "bestaudio[protocol=https][ext=mp3]/bestaudio[protocol=https][ext=m4a]/bestaudio[protocol=https]/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio",
         "skip_download":  True,
         "socket_timeout": 20,
         "retries":        3,
+        "extractor_args": {
+            "soundcloud": {"formats": ["http_mp3_128_url"]},
+        },
     }
+
+    SOURCES = [
+        f"scsearch1:{query}",
+        f"ytsearch1:{query}",
+    ]
 
     for source in SOURCES:
         try:
@@ -736,8 +741,6 @@ class Broadcaster:
             "-reconnect", "1", "-reconnect_streamed", "1",
             "-reconnect_delay_max", "3",
             "-timeout", "10000000",
-            "-allowed_extensions", "ALL",
-            "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,data,pipe",
             "-i", song.url,
             "-vn",
             "-acodec",    "libmp3lame",

@@ -419,7 +419,7 @@ def fetch_song(query: str) -> Optional[Song]:
         "quiet":          True,
         "no_warnings":    True,
         "noplaylist":     True,
-        "format":         "bestaudio[protocol!=hls][acodec!=none]/bestaudio/best",
+        "format":         "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio[protocol=https]/bestaudio/best",
         "skip_download":  True,
         "socket_timeout": 20,
         "retries":        3,
@@ -736,6 +736,8 @@ class Broadcaster:
             "-reconnect", "1", "-reconnect_streamed", "1",
             "-reconnect_delay_max", "3",
             "-timeout", "10000000",
+            "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,data,pipe",
             "-i", song.url,
             "-vn",
             "-acodec",    "libmp3lame",
@@ -1120,7 +1122,10 @@ class RadioBot(BaseBot):
             if nxt: QUEUE.add(nxt, "🤖 تلقائي")
 
         await self._chat("🎙️ Radio v10 جاهز على Render! ▶️")
-        self._task = asyncio.create_task(self._run_queue())
+        # انتظر 3 ثوانٍ حتى يستقر اتصال Highrise قبل تشغيل الأغاني
+        await asyncio.sleep(3)
+        if self._connected:
+            self._task = asyncio.create_task(self._run_queue())
 
     async def on_chat(self, user: User, message: str):
         msg    = message.strip()

@@ -419,7 +419,7 @@ def fetch_song(query: str) -> Optional[Song]:
         "quiet":          True,
         "no_warnings":    True,
         "noplaylist":     True,
-        "format":         "bestaudio/best",
+        "format":         "bestaudio[protocol!=hls][acodec!=none]/bestaudio/best",
         "skip_download":  True,
         "socket_timeout": 20,
         "retries":        3,
@@ -1343,42 +1343,11 @@ class RadioBot(BaseBot):
                         BROADCAST.skip()
                         break
 
-                # إذا انتهت الأغنية بسرعة → أعد المحاولة مرة
+                # إذا انتهت الأغنية بسرعة → تخطى بدون إعادة محاولة
                 elapsed = STATE.elapsed_s()
                 if elapsed < 5 and not _skip_ev.is_set():
-                    log.warning("⚠️ أغنية قصيرة (%ds) — إعادة جلب: %s", elapsed, req.query)
-                    await asyncio.sleep(2)
-                    try:
-                        import yt_dlp as ytdl
-                        opts = {
-                            "quiet": True, "no_warnings": True, "noplaylist": True,
-                            "format": "bestaudio[ext=m4a]/bestaudio/best",
-                            "skip_download": True, "socket_timeout": 20, "retries": 3,
-                            "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
-                        }
-                        with ytdl.YoutubeDL(opts) as ydl:
-                            info2 = ydl.extract_info(f"ytsearch1:{req.query}", download=False)
-                            if info2 and info2.get("entries") and info2["entries"][0]:
-                                e2   = info2["entries"][0]
-                                url2 = e2.get("url", "")
-                                if url2:
-                                    song2 = Song(
-                                        query=req.query,
-                                        title=str(e2.get("title", req.query))[:100],
-                                        url=url2, duration=int(e2.get("duration") or 0),
-                                        by=req.by)
-                                    STATE.set(song2); _done_ev.clear()
-                                    BROADCAST.play(song2)
-                                    max_w2 = (song2.duration if song2.duration > 0 else 7200) + 180
-                                    w2 = 0
-                                    while not _done_ev.is_set() and self._connected:
-                                        await asyncio.sleep(1)
-                                        STATE.tick(); w2 += 1
-                                        if w2 > max_w2: BROADCAST.skip(); break
-                                    STATE.add_history(song2); STATE.set(None)
-                                    await asyncio.sleep(0.2); continue
-                    except Exception as retry_err:
-                        log.error("إعادة فشلت: %s", retry_err)
+                    log.warning("⚠️ أغنية قصيرة (%ds) — تخطي: %s", elapsed, req.query)
+                    CACHE.invalidate(req.query)
 
                 STATE.add_history(song); STATE.set(None)
                 await asyncio.sleep(0.2)

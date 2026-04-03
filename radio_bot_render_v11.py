@@ -1116,6 +1116,8 @@ class RadioBot(BaseBot):
         if self._watchdog and not self._watchdog.done():
             self._watchdog.cancel()
         self._watchdog = asyncio.create_task(self._watchdog_loop())
+        # heartbeat — يبقي اتصال Highrise حياً
+        asyncio.create_task(self._heartbeat())
 
         if QUEUE.empty():
             nxt = AUTOPLAY.next_song()
@@ -1370,6 +1372,22 @@ class RadioBot(BaseBot):
             log.exception("_run_queue خطأ: %s", e)
         finally:
             self._playing = False
+
+    async def _heartbeat(self):
+        """يرسل طلباً لـ Highrise كل 30 ثانية لإبقاء الاتصال حياً"""
+        while self._connected:
+            try:
+                await asyncio.sleep(30)
+                if self._connected:
+                    # نجلب قائمة المستخدمين كـ heartbeat خفيف
+                    await self.highrise.get_room_users()
+                    log.info("💓 Heartbeat OK")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning("💔 Heartbeat فشل: %s", e)
+                if self._connected:
+                    await asyncio.sleep(5)
 
     async def _watchdog_loop(self):
         try:

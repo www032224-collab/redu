@@ -498,34 +498,23 @@ class MyBot(BaseBot):
             self.bot_dancing = True
             self.bot_dance_task = asyncio.create_task(self.bot_auto_dance())
 
-        # 💓 بدء نظام Keep-Alive
+        # 💓 Keep-Alive
         if not hasattr(self, '_keepalive_task') or self._keepalive_task is None or self._keepalive_task.done():
             self._keepalive_task = asyncio.create_task(self._keep_alive_loop())
-            print("💓 Keep-Alive system started")
-
+            print("💓 Keep-Alive started")
 
     async def _keep_alive_loop(self):
-        """
-        💓 نظام Keep-Alive الداخلي الذكي
-        - يرسل طلب حقيقي لـ Highrise API كل 8 دقائق
-        - يبقي الـ event loop و WebSocket حياً
-        - لا يعتمد على HTTP خارجي بل على نفس اتصال البوت
-        """
+        """💓 Keep-Alive داخلي خفيف - يمنع Render من إيقاف البوت"""
         print("💓 Keep-Alive loop running...")
         while True:
             try:
-                await asyncio.sleep(8 * 60)  # كل 8 دقائق (أقل من حد الـ 15)
-                
-                # طلب حقيقي لـ Highrise API — أذكى من أي self-ping
-                room_users = await self.highrise.get_room_users()
-                count = len(getattr(room_users, 'content', []))
-                print(f"💓 Keep-Alive OK | Users: {count} | {__import__('datetime').datetime.now().strftime('%H:%M:%S')}")
-                
+                await asyncio.sleep(10 * 60)  # كل 10 دقائق
+                import datetime
+                print(f"💓 Keep-Alive | {datetime.datetime.now().strftime('%H:%M:%S')}")
             except asyncio.CancelledError:
-                print("💓 Keep-Alive cancelled")
                 break
             except Exception as e:
-                print(f"💓 Keep-Alive error (retrying in 30s): {e}")
+                print(f"💓 Keep-Alive error: {e}")
                 await asyncio.sleep(30)
 
     async def on_user_join(self, user: User, position: Position):

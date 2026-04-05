@@ -1,1467 +1,2549 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║   🎙️  Highrise Radio Bot — v11  (GitHub Storage Edition)   ║
-╠══════════════════════════════════════════════════════════════╣
-║  مصمّم لـ Render.com — مجاني 100% — بيانات على GitHub      ║
-╠══════════════════════════════════════════════════════════════╣
-║  ✅ GitHub API → بيانات تبقى حتى بعد restart               ║
-║  ✅ !addadmin / !removeadmin → يحدّث GitHub فوراً           ║
-║  ✅ !apadd / !apremove → يحدّث GitHub فوراً                 ║
-║  ✅ عند بدء التشغيل → يقرأ آخر بيانات من GitHub            ║
-║  ✅ PORT من متغير البيئة (مطلوب في Render)                  ║
-║  ✅ HTTP Server بـ aiohttp async → يدعم 10,000 مستمع        ║
-║  ✅ Ring Buffer 8MB → RAM ثابتة مهما زاد المستمعون          ║
-║  ✅ /health endpoint → Render يعرف البوت حي                 ║
-║  ✅ Cache 200 أغنية → CPU أقل                               ║
-║  ✅ Watchdog كل 60s → لا موت صامت                           ║
-╚══════════════════════════════════════════════════════════════╝
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  كيفية النشر على Render (مجاني):
-  1. أنشئ repo على GitHub وارفع فيه هذا الملف + requirements.txt
-  2. أضف هذه الملفات في الـ repo:
-       admins.json   → ["SXP3"]
-       autoplay.json → {"songs": [], "idx": 0}
-       queue.json    → []
-  3. في GitHub Settings → Developer Settings → Personal Access Tokens
-       أنشئ Token بصلاحية: repo (كاملة)
-  4. في Render → New → Web Service → اربط الـ repo
-  5. Start Command:  python radio_bot_render_v11.py
-  6. أضف Environment Variables:
-       TOKEN        = توكن Highrise
-       ROOM_ID      = معرف الغرفة
-       OWNER        = اسمك في Highrise
-       GITHUB_TOKEN = التوكن من الخطوة 3
-       GITHUB_REPO  = اسم_المستخدم/اسم_الريبو  (مثال: SXP3/radio-bot)
-  7. Health Check Path: /health
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-
-# ════════════════════════════════════════════════════
-#  تثبيت المتطلبات (عند التشغيل المحلي فقط)
-# ════════════════════════════════════════════════════
-import subprocess, sys, shutil, os
-
-def _pip(pkg, import_name=None):
-    check = import_name or pkg.replace("-", "_").split("[")[0]
-    try:
-        __import__(check)
-        return
-    except ImportError:
-        print(f"⚙️  تثبيت {pkg} ...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", pkg,
-             "--quiet", "--break-system-packages"],
-            capture_output=True, text=True)
-
-_REQUIRED = [
-    ("yt-dlp",           "yt_dlp"),
-    ("highrise-bot-sdk", "highrise"),
-    ("aiohttp",          "aiohttp"),
-    ("websockets",       "websockets"),
-    ("requests",         "requests"),
-]
-for _pkg, _imp in _REQUIRED:
-    _pip(_pkg, _imp)
-
-# ════════════════════════════════════════════════════
-#  الاستيرادات
-# ════════════════════════════════════════════════════
-import asyncio, threading, time, json, logging, collections, dataclasses, base64
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
-import aiohttp
-from aiohttp import web
-from highrise import BaseBot, User
+import asyncio
+import random
+import sys
+import json
+import os
+from highrise import BaseBot, User, Position, RoomPermissions, AnchorPosition, Item, CurrencyItem
+from highrise.models import SessionMetadata
 from highrise.__main__ import main, BotDefinition
 
-# ════════════════════════════════════════════════════
-#  ⚙️  الإعدادات — من متغيرات البيئة
-# ════════════════════════════════════════════════════
-TOKEN        = os.environ.get("TOKEN",   "47c2e8210246ad1c4806a18a33dbdcf899db9e89b2719f5346b6294d3607b4fc")
-ROOM_ID      = os.environ.get("ROOM_ID", "66cfdc844410d5f4f7dafacd")
-OWNER        = os.environ.get("OWNER",   "SXP3")
-STREAM_PORT  = int(os.environ.get("PORT", 10000))
-
-# ══ GitHub Storage (مجاني — يحفظ البيانات بين restarts) ══
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")   # Personal Access Token
-GITHUB_REPO  = os.environ.get("GITHUB_REPO",  "")   # مثال: SXP3/radio-bot
-GITHUB_BRANCH= os.environ.get("GITHUB_BRANCH","main")
-
-QUEUE_MAX    = 50
-HISTORY_MAX  = 15
-FETCH_TIMEOUT= 90
-MAX_LISTENERS= 10_000
-CACHE_MAX    = 200
-PLAY_COOLDOWN= 10
-RING_MB      = 8
-CHUNK_SIZE   = 4096
-
-# ══ ملفات البيانات (في الذاكرة + GitHub) ══
-ADMINS_FILE   = "admins.json"
-QUEUE_FILE    = "queue.json"
-AUTOPLAY_FILE = "autoplay.json"
-FFMPEG        = shutil.which("ffmpeg") or "ffmpeg"
-
-# ════════════════════════════════════════════════════
-#  🗄️  GitHub Storage — قلب نظام الحفظ المجاني
-#  يقرأ ويكتب JSON مباشرة على GitHub
-#  كل عملية حفظ تصير في الخلفية — لا تأخير للمستخدم
-# ════════════════════════════════════════════════════
-class GitHubStorage:
-    BASE = "https://api.github.com"
-
-    def __init__(self):
-        self._ok  = bool(GITHUB_TOKEN and GITHUB_REPO)
-        self._lk  = threading.Lock()
-        # كاش الـ SHA — مطلوب لتحديث الملف على GitHub
-        self._sha: dict[str, str] = {}
-        if self._ok:
-            log.info("✅ GitHub Storage: %s", GITHUB_REPO)
-        else:
-            log.warning("⚠️  GitHub Storage غير مفعّل — البيانات ستُفقد عند restart")
-
-    def _headers(self) -> dict:
-        return {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept":        "application/vnd.github.v3+json",
-            "User-Agent":    "HighriseRadioBot/11",
-        }
-
-    def read(self, filename: str, default) -> any:
-        """يقرأ ملف من GitHub — عند بدء التشغيل"""
-        if not self._ok:
-            return self._read_local(filename, default)
-        import urllib.request, urllib.error
-        url = f"{self.BASE}/repos/{GITHUB_REPO}/contents/{filename}"
-        try:
-            req = urllib.request.Request(url, headers=self._headers())
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read())
-                content = base64.b64decode(data["content"]).decode("utf-8")
-                # احفظ الـ SHA للتحديث لاحقاً
-                with self._lk:
-                    self._sha[filename] = data["sha"]
-                log.info("📥 قرأ من GitHub: %s", filename)
-                return json.loads(content)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                log.info("📄 %s غير موجود على GitHub — استخدام القيمة الافتراضية", filename)
-                return default
-            log.error("GitHub read خطأ %d: %s", e.code, filename)
-            return self._read_local(filename, default)
-        except Exception as e:
-            log.error("GitHub read خطأ: %s", e)
-            return self._read_local(filename, default)
-
-    def write(self, filename: str, data: any):
-        """يكتب ملف على GitHub — في الخلفية (لا يُبطّئ البوت)"""
-        if not self._ok:
-            self._write_local(filename, data)
-            return
-        # نشغّله في thread منفصل لعدم تعطيل البوت
-        t = threading.Thread(
-            target=self._write_sync,
-            args=(filename, data),
-            daemon=True)
-        t.start()
-
-    def _write_sync(self, filename: str, data: any):
-        """الكتابة الفعلية على GitHub"""
-        import urllib.request, urllib.error
-        url     = f"{self.BASE}/repos/{GITHUB_REPO}/contents/{filename}"
-        content = base64.b64encode(
-            json.dumps(data, ensure_ascii=False, indent=2).encode()
-        ).decode()
-        with self._lk:
-            sha = self._sha.get(filename, "")
-        body = {
-            "message": f"🤖 تحديث {filename}",
-            "content": content,
-            "branch":  GITHUB_BRANCH,
-        }
-        if sha:
-            body["sha"] = sha
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(body).encode(),
-                headers={**self._headers(), "Content-Type": "application/json"},
-                method="PUT")
-            with urllib.request.urlopen(req, timeout=15) as r:
-                resp = json.loads(r.read())
-                new_sha = resp.get("content", {}).get("sha", "")
-                if new_sha:
-                    with self._lk:
-                        self._sha[filename] = new_sha
-                log.info("📤 حُفظ على GitHub: %s", filename)
-        except Exception as e:
-            log.error("GitHub write خطأ (%s): %s", filename, e)
-            self._write_local(filename, data)
-
-    def _read_local(self, filename: str, default) -> any:
-        """قراءة محلية احتياطية"""
-        try:
-            if os.path.exists(filename):
-                with open(filename, encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception: pass
-        return default
-
-    def _write_local(self, filename: str, data: any):
-        """كتابة محلية احتياطية"""
-        try:
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception: pass
-
-
-GH = GitHubStorage()
-
-# ════════════════════════════════════════════════════
-#  Logging
-# ════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S")
-for _noisy in ("aiohttp", "asyncio", "concurrent", "urllib3", "aiohttp.access"):
-    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
-log = logging.getLogger("Radio")
-
-_EXEC = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ytdlp")
-
-# ════════════════════════════════════════════════════
-#  صمت أولي
-# ════════════════════════════════════════════════════
-def _make_silence() -> bytes:
-    try:
-        r = subprocess.run(
-            [FFMPEG, "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-             "-t", "0.5", "-acodec", "libmp3lame", "-ab", "128k",
-             "-f", "mp3", "pipe:1", "-loglevel", "error"],
-            capture_output=True, timeout=5)
-        d = r.stdout
-        i = d.find(b"\xff\xfb")
-        return d[i:] if i >= 0 else d
-    except Exception:
-        return (b"\xff\xfb\x90\x00" + b"\x00" * 413) * 4
-
-SILENCE_CHUNK = (_make_silence() * 8)[:CHUNK_SIZE]
-
-# ════════════════════════════════════════════════════
-#  نماذج البيانات
-# ════════════════════════════════════════════════════
-@dataclasses.dataclass
-class Request:
-    query: str
-    by:    str
-    at:    float = dataclasses.field(default_factory=time.time)
-    def to_dict(self): return {"query": self.query, "by": self.by, "at": self.at}
-    @staticmethod
-    def from_dict(d): return Request(query=d["query"], by=d["by"], at=d.get("at", 0))
-
-@dataclasses.dataclass
-class Song:
-    query:    str
-    title:    str
-    url:      str
-    duration: int
-    by:       str
-    @property
-    def dur_str(self) -> str:
-        if self.duration <= 0: return "؟"
-        m, s = divmod(self.duration, 60)
-        return f"{m}:{s:02d}"
-
-# ════════════════════════════════════════════════════
-#  Ring Buffer — يدعم 10,000 مستمع بـ RAM ثابتة
-# ════════════════════════════════════════════════════
-class RingBuffer:
-    _SAFE = int((1 << 32) * 0.75)
-
-    def __init__(self, mb: int):
-        self._size  = mb * 1024 * 1024
-        self._buf   = bytearray(self._size)
-        self._mv    = memoryview(self._buf)
-        self._wpos  = 0
-        self._total = 0
-        self._lids: dict[int, int] = {}
-        self._nid   = 0
-        self._cond  = threading.Condition(threading.Lock())
-
-    def write(self, data: bytes):
-        with self._cond:
-            n, wp = len(data), self._wpos
-            if wp + n <= self._size:
-                self._mv[wp:wp+n] = data
-            else:
-                f = self._size - wp
-                self._mv[wp:]  = data[:f]
-                self._mv[:n-f] = data[f:]
-            self._wpos   = (wp + n) % self._size
-            self._total += n
-            if self._total > self._SAFE:
-                shift = self._total - self._size * 2
-                if shift > 0:
-                    self._total -= shift
-                    for lid in self._lids:
-                        self._lids[lid] = max(
-                            self._total - self._size,
-                            self._lids[lid] - shift)
-            self._cond.notify_all()
-
-    def add_listener(self) -> int:
-        with self._cond:
-            lid = self._nid % 1_000_000
-            self._nid += 1
-            self._lids[lid] = self._total
-            return lid
-
-    def remove_listener(self, lid: int):
-        with self._cond:
-            self._lids.pop(lid, None)
-
-    def read(self, lid: int, timeout: float = 3.0) -> Optional[bytes]:
-        with self._cond:
-            end = time.monotonic() + timeout
-            while lid in self._lids:
-                avail = self._total - self._lids[lid]
-                if avail >= CHUNK_SIZE:
-                    if avail > 16000 * 3:
-                        self._lids[lid] = self._total - CHUNK_SIZE
-                    rp = self._lids[lid]
-                    bp = (self._wpos - (self._total - rp)) % self._size
-                    if bp + CHUNK_SIZE <= self._size:
-                        chunk = bytes(self._mv[bp:bp+CHUNK_SIZE])
-                    else:
-                        f     = self._size - bp
-                        chunk = bytes(self._mv[bp:]) + bytes(self._mv[:CHUNK_SIZE-f])
-                    self._lids[lid] = rp + CHUNK_SIZE
-                    return chunk
-                rem = end - time.monotonic()
-                if rem <= 0: return None
-                self._cond.wait(timeout=min(rem, 0.3))
-            return None
-
-    def sync_all(self):
-        with self._cond:
-            for lid in self._lids:
-                self._lids[lid] = self._total
-            self._cond.notify_all()
-
-    def count(self) -> int:
-        with self._cond: return len(self._lids)
-
-    def wake(self):
-        with self._cond: self._cond.notify_all()
-
-
-RING = RingBuffer(RING_MB)
-
-# ════════════════════════════════════════════════════
-#  Cache الأغاني
-# ════════════════════════════════════════════════════
-class SongCache:
-    def __init__(self, maxsize: int):
-        self._d:    dict[str, Song] = {}
-        self._keys: list[str]       = []
-        self._max   = maxsize
-        self._lk    = threading.Lock()
-
-    def _key(self, q: str) -> str: return q.strip().lower()
-
-    def get(self, query: str) -> Optional[Song]:
-        with self._lk: return self._d.get(self._key(query))
-
-    def put(self, query: str, song: Song):
-        with self._lk:
-            k = self._key(query)
-            if k in self._d: return
-            self._d[k] = song
-            self._keys.append(k)
-            if len(self._keys) > self._max:
-                old = self._keys.pop(0)
-                self._d.pop(old, None)
-
-    def invalidate(self, query: str):
-        with self._lk:
-            k = self._key(query)
-            self._d.pop(k, None)
-            if k in self._keys: self._keys.remove(k)
-
-
-CACHE = SongCache(CACHE_MAX)
-
-# ════════════════════════════════════════════════════
-#  yt-dlp — جلب معلومات الأغنية (رابط جديد دائماً)
-# ════════════════════════════════════════════════════
-def fetch_song(query: str) -> Optional[Song]:
-    import yt_dlp as ytdl
-
-    opts = {
-        "quiet":          True,
-        "no_warnings":    True,
-        "noplaylist":     True,
-        "format":         "http_mp3_128_url/http_aac_128_url/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio",
-        "skip_download":  True,
-        "socket_timeout": 20,
-        "retries":        3,
-    }
-
-    # SoundCloud أولاً لأنه لا يحتاج تسجيل دخول
-    # YouTube احتياطي
-    for source in [f"scsearch1:{query}", f"ytsearch1:{query}"]:
-        try:
-            with ytdl.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(source, download=False)
-                if not info or not info.get("entries"):
-                    continue
-                e = info["entries"][0]
-                if not e:
-                    continue
-                url = e.get("url", "")
-                if not url:
-                    fmts = [f for f in e.get("formats", [])
-                            if f.get("acodec") != "none" and f.get("vcodec") == "none"]
-                    url = (fmts[-1] if fmts else e.get("formats", [{}])[-1]).get("url", "")
-                if not url:
-                    continue
-                song = Song(
-                    query    = query,
-                    title    = str(e.get("title", query))[:100],
-                    url      = url,
-                    duration = int(e.get("duration") or 0),
-                    by       = "")
-                CACHE.put(query, song)
-                log.info("✅ وجد من %s: %s", source.split(":")[0], song.title)
-                return song
-        except Exception as e:
-            err = str(e)
-            if "Sign in" in err or "bot" in err.lower() or "No video formats" in err:
-                log.warning("⚠️ %s محجوب — تجربة المصدر التالي...", source.split(":")[0])
-                continue
-            log.error("fetch_song خطأ (%s): %s", source.split(":")[0], e)
-            continue
-
-    log.error("❌ فشل جلب الأغنية من كل المصادر: %s", query)
-    return None
-
-# ════════════════════════════════════════════════════
-#  مدير القائمة
-# ════════════════════════════════════════════════════
-class QueueManager:
-    def __init__(self):
-        self._lk = threading.RLock()
-        self._q: list[Request] = []
-        self._load()
-
-    def _load(self):
-        try:
-            data = GH.read(QUEUE_FILE, [])
-            self._q = [Request.from_dict(d) for d in data]
-            log.info("📂 queue: %d طلب", len(self._q))
-        except Exception as e:
-            log.warning("queue load: %s", e)
-            self._q = []
-
-    def _save(self):
-        GH.write(QUEUE_FILE, [r.to_dict() for r in self._q])
-
-    def add(self, query: str, by: str) -> str:
-        with self._lk:
-            if len(self._q) >= QUEUE_MAX: return f"❌ القائمة ممتلئة ({QUEUE_MAX})"
-            self._q.append(Request(query=query, by=by))
-            self._save()
-            return ""
-
-    def pop(self) -> Optional[Request]:
-        with self._lk:
-            if not self._q: return None
-            r = self._q.pop(0); self._save(); return r
-
-    def remove(self, i: int) -> Optional[Request]:
-        with self._lk:
-            if 0 <= i < len(self._q):
-                r = self._q.pop(i); self._save(); return r
-            return None
-
-    def clear(self):
-        with self._lk: self._q.clear(); self._save()
-
-    def peek(self) -> Optional[Request]:
-        with self._lk: return self._q[0] if self._q else None
-
-    def snap(self) -> list:
-        with self._lk: return list(self._q)
-
-    def size(self) -> int:
-        with self._lk: return len(self._q)
-
-    def empty(self) -> bool:
-        with self._lk: return not self._q
-
-
-QUEUE = QueueManager()
-
-# ════════════════════════════════════════════════════
-#  مدير التشغيل التلقائي
-# ════════════════════════════════════════════════════
-import random as _random
-
-_DEFAULT_AUTOPLAY = [
-    "Blinding Lights The Weeknd",
-    "Shape of You Ed Sheeran",
-    "Bohemian Rhapsody Queen",
-    "Hotel California Eagles",
-    "Rolling in the Deep Adele",
-    "Uptown Funk Bruno Mars",
-    "Someone Like You Adele",
-    "Happy Pharrell Williams",
-    "Despacito Luis Fonsi",
-    "Stay The Kid LAROI Justin Bieber",
-]
-
-class AutoplayManager:
-    def __init__(self):
-        self._lk    = threading.RLock()
-        self._songs: list[str] = []
-        self._idx   = 0
-        self._load()
-
-    def _load(self):
-        try:
-            data = GH.read(AUTOPLAY_FILE, {"songs": _DEFAULT_AUTOPLAY[:], "idx": 0})
-            self._songs = data.get("songs", _DEFAULT_AUTOPLAY[:])
-            self._idx   = data.get("idx", 0) % max(1, len(data.get("songs", [1])))
-            log.info("📂 autoplay: %d أغنية", len(self._songs))
-            return
-        except Exception as e:
-            log.warning("autoplay load: %s", e)
-        self._songs = _DEFAULT_AUTOPLAY[:]
-        self._save()
-
-    def _save(self):
-        GH.write(AUTOPLAY_FILE, {"songs": self._songs, "idx": self._idx})
-
-    def next_song(self) -> Optional[str]:
-        with self._lk:
-            if not self._songs: return None
-            q = self._songs[self._idx % len(self._songs)]
-            self._idx = (self._idx + 1) % len(self._songs)
-            self._save()
-            return q
-
-    def add(self, song: str) -> str:
-        with self._lk:
-            s = song.strip()
-            if s.lower() in [x.lower() for x in self._songs]:
-                return "⚠️ الأغنية موجودة مسبقاً"
-            self._songs.append(s)
-            self._save()
-            return f"✅ أُضيفت #{len(self._songs)}"
-
-    def remove(self, i: int) -> Optional[str]:
-        with self._lk:
-            if 0 <= i < len(self._songs):
-                s = self._songs.pop(i)
-                if self._idx >= len(self._songs) and self._songs:
-                    self._idx = 0
-                self._save()
-                return s
-            return None
-
-    def clear(self):
-        with self._lk:
-            self._songs.clear(); self._idx = 0; self._save()
-
-    def snap(self) -> list:
-        with self._lk: return list(self._songs)
-
-    def size(self) -> int:
-        with self._lk: return len(self._songs)
-
-
-AUTOPLAY = AutoplayManager()
-
-# ════════════════════════════════════════════════════
-#  الحالة العامة
-# ════════════════════════════════════════════════════
-class State:
-    def __init__(self):
-        self._lk     = threading.RLock()
-        self.song:   Optional[Song] = None
-        self.elapsed = 0
-        self.history = collections.deque(maxlen=HISTORY_MAX)
-        self.admins  = self._load_admins()
-
-    def set(self, s: Optional[Song]):
-        with self._lk: self.song = s; self.elapsed = 0
-
-    def get(self) -> Optional[Song]:
-        with self._lk: return self.song
-
-    def tick(self):
-        with self._lk:
-            if self.song: self.elapsed += 1
-
-    def elapsed_s(self) -> int:
-        with self._lk: return self.elapsed
-
-    def add_history(self, s: Song):
-        with self._lk: self.history.appendleft(s)
-
-    def get_history(self) -> list:
-        with self._lk: return list(self.history)
-
-    def is_admin(self, u: str) -> bool:
-        with self._lk: return u.lower() in self.admins
-
-    def add_admin(self, u: str):
-        with self._lk: self.admins.add(u.lower()); self._save_admins()
-
-    def del_admin(self, u: str):
-        with self._lk: self.admins.discard(u.lower()); self._save_admins()
-
-    def _load_admins(self) -> set:
-        s = set()
-        try:
-            data = GH.read(ADMINS_FILE, [])
-            s = set(data) if isinstance(data, list) else set()
-        except Exception: pass
-        if OWNER: s.add(OWNER.lower())
-        return s
-
-    def _save_admins(self):
-        GH.write(ADMINS_FILE, list(self.admins))
-
-    def to_dict(self) -> dict:
-        with self._lk:
-            s = self.song
-            return {
-                "playing":   s is not None,
-                "title":     s.title    if s else "لا يوجد بث",
-                "duration":  s.duration if s else 0,
-                "elapsed":   self.elapsed,
-                "by":        s.by       if s else "",
-                "listeners": RING.count(),
-                "queue":     [{"query": r.query, "by": r.by} for r in QUEUE.snap()],
-                "history":   [{"title": h.title, "by": h.by} for h in self.history],
-            }
-
-
-STATE = State()
-
-# ════════════════════════════════════════════════════
-#  أحداث التحكم
-# ════════════════════════════════════════════════════
-_skip_ev  = threading.Event()
-_done_ev  = threading.Event()
-_done_ev.set()
-
-_loop:    Optional[asyncio.AbstractEventLoop] = None
-_bot_ref: Optional["RadioBot"]               = None
-
-# ════════════════════════════════════════════════════
-#  محرك البث (Thread واحد يكتب على Ring Buffer)
-# ════════════════════════════════════════════════════
-class Broadcaster:
-    def __init__(self):
-        self._next: Optional[Song] = None
-        self._lk   = threading.Lock()
-        self._proc: Optional[subprocess.Popen] = None
-
-    def start(self):
-        t = threading.Thread(target=self._loop, daemon=True, name="bcast")
-        t.start()
-        log.info("✅ Broadcaster يعمل")
-
-    def play(self, song: Song):
-        with self._lk: self._next = song
-        _skip_ev.set()
-        _done_ev.clear()
-
-    def skip(self): _skip_ev.set()
-
-    def _kill(self):
-        p = self._proc
-        if not p: return
-        try:
-            p.terminate()
-            try:    p.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                try:    p.kill(); p.wait(timeout=2)
-                except Exception: pass
-        except Exception: pass
-        try:    p.stdout.read()
-        except Exception: pass
-        self._proc = None
-
-    def _loop(self):
-        while True:
-            try:
-                with self._lk:
-                    song, self._next = self._next, None
-                if song:
-                    _skip_ev.clear()
-                    self._stream(song)
-                    _done_ev.set()
-                else:
-                    RING.write(SILENCE_CHUNK)
-                    time.sleep(CHUNK_SIZE / 16000)
-            except Exception as e:
-                log.error("Broadcaster خطأ: %s", e)
-                _done_ev.set()
-                time.sleep(1)
-
-    def _stream(self, song: Song):
-        log.info("📡 بث: %s", song.title)
-        RING.sync_all()
-        cmd = [
-            FFMPEG,
-            "-reconnect", "1", "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "3",
-            "-timeout", "10000000",
-            "-i", song.url,
-            "-vn",
-            "-acodec",    "libmp3lame",
-            "-ab",        "128k",
-            "-ar",        "44100",
-            "-ac",        "2",
-            "-reservoir", "0",
-            "-f",         "mp3",
-            "-loglevel",  "error",
-            "pipe:1",
-        ]
-        try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0)
-            RING.write(SILENCE_CHUNK * 2)
-            bps       = 16000
-            intv      = CHUNK_SIZE / bps
-            nxt       = time.monotonic()
-            bytes_out = 0
-            while True:
-                if _skip_ev.is_set(): break
-                if self._proc.poll() is not None:
-                    rest = self._proc.stdout.read()
-                    if rest:
-                        RING.write(rest)
-                        bytes_out += len(rest)
-                    break
-                chunk = self._proc.stdout.read(CHUNK_SIZE)
-                if not chunk: break
-                RING.write(chunk)
-                bytes_out += len(chunk)
-                nxt += intv
-                sl   = nxt - time.monotonic()
-                if   sl > 0:  time.sleep(sl)
-                elif sl < -2: nxt = time.monotonic()
-
-            if bytes_out < 10_000 and not _skip_ev.is_set():
-                try:    stderr_out = self._proc.stderr.read(500)
-                except: stderr_out = b""
-                log.warning("⚠️ بث قصير (%d bytes) stderr: %s",
-                            bytes_out, stderr_out.decode(errors="replace")[:150])
-                CACHE.invalidate(song.query)
-        except Exception as e:
-            log.error("_stream خطأ: %s", e)
-        finally:
-            self._kill()
-            _done_ev.set()
-            log.info("🏁 انتهى: %s", song.title)
-
-
-BROADCAST = Broadcaster()
-BROADCAST.start()
-
-# ════════════════════════════════════════════════════
-#  مستمع وهمي — يبقي الـ Ring Buffer نشطاً
-# ════════════════════════════════════════════════════
-def _keepalive():
-    lid = RING.add_listener()
-    while True:
-        try:    RING.read(lid, timeout=5)
-        except Exception: time.sleep(1)
-
-threading.Thread(target=_keepalive, daemon=True, name="keepalive").start()
-
-# ════════════════════════════════════════════════════
-#  ✅ HTTP Server بـ aiohttp (async — أفضل بكثير من ThreadingMixIn)
-#  يدعم 10,000 اتصال متزامن بدون تعب
-# ════════════════════════════════════════════════════
-async def _handle_stream(request: web.Request) -> web.StreamResponse:
-    """نقطة البث — async streaming handler"""
-    if RING.count() >= MAX_LISTENERS:
-        return web.Response(status=503, text="البث ممتلئ")
-
-    resp = web.StreamResponse(
-        status=200,
-        headers={
-            "Content-Type":  "audio/mpeg",
-            "Cache-Control": "no-cache, no-store",
-            "Connection":    "keep-alive",
-            "icy-name":      "Highrise Radio",
-            "icy-br":        "128",
-            "Access-Control-Allow-Origin": "*",
-        })
-    await resp.prepare(request)
-
-    # صمت أولي لتشغيل المشغّل
-    try:
-        await resp.write(SILENCE_CHUNK * 4)
-    except Exception:
-        return resp
-
-    lid = RING.add_listener()
-    log.info("🔗 مستمع #%d [%d]", lid, RING.count())
-
-    loop = asyncio.get_event_loop()
-    try:
-        while True:
-            # نقرأ الـ chunk في executor لأن RING.read يستخدم Condition
-            chunk = await loop.run_in_executor(
-                None, lambda: RING.read(lid, timeout=2.0))
-            if chunk is None:
-                # لا بيانات بعد — أرسل صمت لإبقاء الاتصال
-                try:
-                    await resp.write(SILENCE_CHUNK)
-                except Exception:
-                    break
-                continue
-            try:
-                await resp.write(chunk)
-            except Exception:
-                break
-    except Exception:
-        pass
-    finally:
-        RING.remove_listener(lid)
-        log.info("📴 مستمع #%d [%d]", lid, RING.count())
-
-    return resp
-
-
-async def _handle_health(request: web.Request) -> web.Response:
-    """✅ Health Check — Render يستخدمه لمعرفة أن الخدمة حية"""
-    return web.Response(
-        text=json.dumps({"status": "ok", "listeners": RING.count()}, ensure_ascii=False),
-        content_type="application/json")
-
-
-async def _handle_status(request: web.Request) -> web.Response:
-    return web.Response(
-        text=json.dumps(STATE.to_dict(), ensure_ascii=False),
-        content_type="application/json",
-        headers={"Access-Control-Allow-Origin": "*"})
-
-
-async def _handle_stop(request: web.Request) -> web.Response:
-    QUEUE.clear(); STATE.set(None)
-    if _bot_ref: _bot_ref._playing = False
-    BROADCAST.skip()
-    return web.Response(text='{"ok":true}', content_type="application/json")
-
-
-async def _handle_play_api(request: web.Request) -> web.Response:
-    try:
-        data = await request.json()
-        q = data.get("query", "").strip()
-        if q and _loop:
-            _loop.call_soon_threadsafe(
-                lambda qq=q: asyncio.ensure_future(
-                    _web_play(qq), loop=_loop))
-            return web.Response(text='{"ok":true}', content_type="application/json")
-        return web.Response(status=400, text='{"error":"empty"}',
-                            content_type="application/json")
-    except Exception:
-        return web.Response(status=400, text='{"error":"bad"}',
-                            content_type="application/json")
-
-
-async def _handle_panel(request: web.Request) -> web.Response:
-    d   = STATE.to_dict()
-    pct = round(d["elapsed"] / d["duration"] * 100) if d["duration"] else 0
-    ef  = f"{d['elapsed']//60}:{d['elapsed']%60:02d}"
-    df  = f"{d['duration']//60}:{d['duration']%60:02d}"
-    # رابط البث عبر Render subdomain أو IP
-    host = request.host
-    url  = f"https://{host}/stream" if "onrender.com" in host else f"http://{host}/stream"
-    dot  = "#10b981" if d["playing"] else "#ef4444"
-
-    q_rows = "".join(
-        f"<tr><td class=n>{i+1}</td><td>{r['query']}</td>"
-        f"<td class=dim>@{r['by']}</td></tr>"
-        for i, r in enumerate(d["queue"])
-    ) or "<tr><td colspan=3 class=empty>القائمة فارغة</td></tr>"
-
-    h_rows = "".join(
-        f"<tr><td>{h['title']}</td><td class=dim>@{h['by']}</td></tr>"
-        for h in d["history"]
-    ) or "<tr><td colspan=2 class=empty>لا يوجد سجل</td></tr>"
-
-    html = f"""<!DOCTYPE html><html lang=ar dir=rtl>
-<head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>🎙️ Radio v10</title>
-<style>
-:root{{--bg:#0d0d1a;--card:#161628;--b:#252540;--ac:#7c3aed;--tx:#e2e8f0;--dim:#64748b}}
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:var(--bg);color:var(--tx);font-family:'Segoe UI',Arial,sans-serif;padding:16px}}
-.w{{max-width:700px;margin:0 auto}}
-h1{{text-align:center;font-size:1.4em;margin-bottom:14px;
-    background:linear-gradient(135deg,#a855f7,#3b82f6);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent}}
-.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}}
-.box{{background:var(--card);border:1px solid var(--b);border-radius:10px;padding:10px;text-align:center}}
-.bv{{font-size:1.3em;font-weight:700;color:var(--ac)}}
-.bl{{font-size:.7em;color:var(--dim);margin-top:2px}}
-.card{{background:var(--card);border:1px solid var(--b);border-radius:14px;padding:16px;margin-bottom:10px}}
-.lbl{{font-size:.7em;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:7px}}
-.tl{{font-size:1em;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.pb{{background:var(--b);border-radius:99px;height:4px;margin:8px 0 4px}}
-.pf{{background:linear-gradient(90deg,var(--ac),#2563eb);height:4px;border-radius:99px;
-     width:{pct}%;transition:width 1s linear}}
-.tr{{display:flex;justify-content:space-between;font-size:.76em;color:var(--dim)}}
-.row{{display:flex;gap:8px;margin-bottom:10px}}
-input{{flex:1;padding:10px 14px;background:#1a1a30;border:1px solid var(--b);
-       border-radius:10px;color:var(--tx);font-size:.9em;outline:none}}
-input:focus{{border-color:var(--ac)}}
-.btn{{padding:10px 18px;border:none;border-radius:10px;cursor:pointer;
-      font-weight:700;font-size:.9em;color:#fff}}
-.g{{background:linear-gradient(135deg,#10b981,#059669)}}
-.r{{background:linear-gradient(135deg,#ef4444,#b91c1c);width:100%}}
-.meta{{display:flex;justify-content:space-between;font-size:.75em;color:var(--dim);margin-bottom:10px}}
-.meta a{{color:#3b82f6;text-decoration:none}}
-.dot{{display:inline-block;width:7px;height:7px;border-radius:50%;
-      background:{dot};margin-left:5px;vertical-align:middle}}
-table{{width:100%;border-collapse:collapse;font-size:.86em}}
-th{{color:var(--dim);font-weight:500;padding:5px 4px;border-bottom:1px solid var(--b);text-align:right}}
-td{{padding:7px 4px;border-bottom:1px solid #13132a}}
-.n{{color:var(--ac);font-weight:700;width:26px}}
-.dim{{color:var(--dim);font-size:.84em}}
-.empty{{text-align:center;color:var(--dim);padding:12px}}
-.badge{{background:#1e1e35;padding:3px 8px;border-radius:20px;font-size:.7em;color:var(--dim);margin-bottom:8px;display:inline-block}}
-</style></head><body><div class=w>
-<h1>🎙️ Highrise Radio v10</h1>
-<div class=badge>🚀 Render v11 — GitHub Storage — يدعم {MAX_LISTENERS:,} مستمع</div>
-<div class=grid>
-  <div class=box><div class=bv id=LC>{d["listeners"]}</div><div class=bl>👂 مستمع</div></div>
-  <div class=box><div class=bv>{QUEUE.size()}</div><div class=bl>📋 قائمة</div></div>
-  <div class=box><div class=bv>{len(d["history"])}</div><div class=bl>🕒 سجل</div></div>
-</div>
-<div class=meta>
-  <span>📻 <a href="{url}" target=_blank>رابط البث</a></span>
-  <span><span class=dot></span>{'بث مباشر' if d['playing'] else 'انتظار'}</span>
-</div>
-<div class=card>
-  <div class=lbl>🎵 يُشغَّل الآن</div>
-  <div class=tl id=T>{d['title']}</div>
-  <div class=pb><div class=pf id=P></div></div>
-  <div class=tr><span id=E>{ef}</span><span id=D>{df}</span></div>
-</div>
-<div class=row>
-  <input id=Q placeholder="اسم الأغنية..." onkeydown="if(event.key==='Enter')play()">
-  <button class="btn g" onclick=play()>▶️ تشغيل</button>
-</div>
-<button class="btn r" onclick="api('/api/stop')">⏹️ إيقاف + مسح القائمة</button>
-<br><br>
-<div class=card>
-  <div class=lbl>📋 القائمة</div>
-  <table><thead><tr><th>#</th><th>الطلب</th><th>الطالب</th></tr></thead>
-  <tbody id=QB>{q_rows}</tbody></table>
-</div>
-<div class=card>
-  <div class=lbl>🕒 آخر الأغاني</div>
-  <table><thead><tr><th>الأغنية</th><th>الطالب</th></tr></thead>
-  <tbody id=HB>{h_rows}</tbody></table>
-</div>
-</div>
-<script>
-let D=0,E=0;
-const $=x=>document.getElementById(x);
-const fmt=s=>{{s=Math.max(0,s|0);return(s/60|0)+':'+String(s%60).padStart(2,'0')}};
-async function api(u,b){{
-  await fetch(u,{{method:'POST',...(b?{{headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}}:{{}})}});
-  setTimeout(poll,300);
-}}
-async function play(){{
-  const q=$('Q').value.trim();if(!q)return;
-  await api('/api/play',{{query:q}});$('Q').value='';
-}}
-async function poll(){{
-  try{{
-    const d=await(await fetch('/api/status')).json();
-    $('T').textContent=d.title;D=d.duration;E=d.elapsed;
-    $('D').textContent=fmt(D);$('E').textContent=fmt(E);
-    $('P').style.width=(D>0?Math.min(100,E/D*100):0)+'%';
-    $('LC').textContent=d.listeners;
-    $('QB').innerHTML=d.queue.length
-      ?d.queue.map((r,i)=>`<tr><td class=n>${{i+1}}</td><td>${{r.query}}</td><td class=dim>@${{r.by}}</td></tr>`).join('')
-      :'<tr><td colspan=3 class=empty>القائمة فارغة</td></tr>';
-    $('HB').innerHTML=d.history.length
-      ?d.history.map(h=>`<tr><td>${{h.title}}</td><td class=dim>@${{h.by}}</td></tr>`).join('')
-      :'<tr><td colspan=2 class=empty>لا يوجد سجل</td></tr>';
-  }}catch(e){{}}
-}}
-poll();setInterval(poll,3000);
-setInterval(()=>{{if(D>0&&E<D){{E++;$('E').textContent=fmt(E);$('P').style.width=Math.min(100,E/D*100)+'%';}}}},1000);
-</script></body></html>"""
-    return web.Response(text=html, content_type="text/html", charset="utf-8")
-
-
-async def _start_http_server():
-    """✅ aiohttp بدلاً من ThreadingMixIn — يدعم 10k اتصال async"""
-    app = web.Application()
-    app.router.add_get("/stream",      _handle_stream)
-    app.router.add_get("/health",      _handle_health)   # ✅ Render health check
-    app.router.add_get("/",            _handle_panel)
-    app.router.add_get("/panel",       _handle_panel)
-    app.router.add_get("/api/status",  _handle_status)
-    app.router.add_post("/api/stop",   _handle_stop)
-    app.router.add_post("/api/play",   _handle_play_api)
-
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", STREAM_PORT)
-    await site.start()
-    log.info("✅ aiohttp على بورت %d", STREAM_PORT)
-
-
-async def _web_play(query: str):
-    if not _bot_ref: return
-    BROADCAST.skip()
-    QUEUE.clear()
-    STATE.set(None)
-    QUEUE.add(query, "🌐 ويب")
-    if not _bot_ref._playing:
-        asyncio.ensure_future(_bot_ref._run_queue())
-
-# ════════════════════════════════════════════════════
-#  رسائل المساعدة
-# ════════════════════════════════════════════════════
-_HELP_ALL = """\
-🎙️ أوامر الراديو:
-▶️ !play اسم — أضف للقائمة
-⏭️ !skip — تخطي
-📋 !queue / !q — القائمة
-🎵 !np — يُشغَّل الآن
-🕒 !history — آخر الأغاني
-❓ !help — المساعدة"""
-
-_HELP_ADMIN = """
-👮 أوامر الأدمن:
-⏹️ !stop — إيقاف + مسح
-🗑️ !remove رقم — حذف من القائمة
-➕ !addadmin اسم
-➖ !removeadmin اسم
-👥 !admins
-─────────────
-🔁 قائمة التلقائي:
-📋 !aplist
-➕ !apadd اسم
-🗑️ !apremove رقم
-💥 !apclear"""
-
-# ════════════════════════════════════════════════════
-#  البوت
-# ════════════════════════════════════════════════════
-class RadioBot(BaseBot):
-
+# Resolve encoding issues on Windows
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
+class MyBot(BaseBot):
     def __init__(self):
         super().__init__()
-        self._playing   = False
-        self._connected = False
-        self._task:     Optional[asyncio.Task] = None
-        self._watchdog: Optional[asyncio.Task] = None
+        self.owners = ["omar___p", "EZ11", "BM15", "N97_"]  # 👑 الملاك
+        self.admins = ["", ""]  # قائمة المشرفين
+        self.vip_users = []  # ⭐ قائمة VIP
+        self.distinguished_users = []  # ✨ قائمة المتميزين (محميين من التفاعلات)
+        self.muted_users = {}  # المستخدمين المكتومين
+        self.frozen_users = {}  # المستخدمين المجمدين
+        self.user_floors = {}   # تتبع طابق كل مستخدم للنقل الذكي
+        self.warned_users = {}  # المستخدمين المحذرين
+        self.auto_mod = True  # التحكم التلقائي
+        self.spam_protection = True  # الحماية من السبام
+        self.user_messages = {}  # تتبع رسائل المستخدمين للحماية من السبام
+        self.interaction_history = set()  # 📨 مستخدمين تفاعلوا مع البوت (رسائل خاصة أو جولد)
+        self.welcome_message = "نورت روم المنتجع 🌿✨"  # رسالة الترحيب الافتراضية
+        self.custom_welcomes = {}   # رسائل ترحيب خاصة لأشخاص محددين
+        self.welcome_public = True  # الترحيب في الشات العام
+        self.banned_words = []  # الكلمات المحظورة
+        
+        # 🏢 إحداثيات الطوابق (تم ضبطها بدقة حسب الصور)
+        self.floors = {
+            "ground": Position(15.5, 0.25, 14.5, "FrontRight"),      # الأرضية
+            "floor1": Position(12.5, 8.25, 17.0, "FrontRight"),     # فوق
+            "floor2": Position(10.5, 17.5, 11.0, "FrontLeft"),    # فوق2
+            "vip": Position(12.0, 13.75, 0.5, "FrontLeft"),        # VIP
+        }
+        
+        # 🤖 موقع البوت الافتراضي
+        self.bot_position = Position(15.5, 0.25, 14.5, "FrontRight")
+        self.config_file = "bot_config.json"
+        self.load_config()
+        
+        # 🎭 نظام الرقصات - أسماء نصية مع دعم للأرقام عبر القائمة
+        self.emotes = {
+            "Floating": {"id": "emote-float", "dur": 8, "ar": ["طفو", "تحليق"]},
+            "SleighRide": {"id": "emote-sleigh", "dur": 9, "ar": ["زلاجة", "تزلج"]},
+            "EmoteFashionista": {"id": "emote-fashionista", "dur": 5, "ar": ["فاشن", "موضة"]},
+            "Cheerful": {"id": "emote-pose8", "dur": 4, "ar": ["مبتهج", "بهجة"]},
+            "DanceIcecream": {"id": "dance-icecream", "dur": 14, "ar": ["ايسكريم", "بوظة"]},
+            "Macarena": {"id": "dance-macarena", "dur": 12, "ar": ["ماكرينا", "مكارينا"]},
+            "EmbracingModel": {"id": "emote-pose7", "dur": 4, "ar": ["موديل_احتضان"]},
+            "ShuffleDance": {"id": "dance-tiktok10", "dur": 8, "ar": ["شافل", "خلط"]},
+            "LambisPose": {"id": "emote-superpose", "dur": 4, "ar": ["بوز_سوبر"]},
+            "GraveDance": {"id": "dance-weird", "dur": 21, "ar": ["رقص_غريب"]},
+            "ViralGroove": {"id": "dance-tiktok9", "dur": 11, "ar": ["فايرال", "رقص_تيك"]},
+            "EmoteCute": {"id": "emote-cute", "dur": 6, "ar": ["كيوت", "لطيف"]},
+            "TheWave": {"id": "emote-wave", "dur": 2.5, "ar": ["موجة", "هاي"]},
+            "Kiss": {"id": "emote-kiss", "dur": 2, "ar": ["بوسه", "قبلة", "بوس"]},
+            "Laugh": {"id": "emote-laughing", "dur": 2.5, "ar": ["ضحك", "هههه"]},
+            "Sweating": {"id": "emote-hot", "dur": 4, "ar": ["عرق", "حر"]},
+            "ImACutie": {"id": "emote-cutey", "dur": 3, "ar": ["كيوتي", "حلو"]},
+            "FashionPose": {"id": "emote-pose5", "dur": 4, "ar": ["بوز_فاشن"]},
+            "Teleport": {"id": "emote-teleporting", "dur": 11, "ar": ["تليبورت", "انتقال"]},
+            "LetsGoShopping": {"id": "dance-shoppingcart", "dur": 4, "ar": ["تسوق", "شوبنق"]},
+            "GreedyEmote": {"id": "emote-greedy", "dur": 4, "ar": ["طماع", "جشع"]},
+            "IChallengeYou": {"id": "emote-pose3", "dur": 5, "ar": ["تحدي"]},
+            "FlirtyWink": {"id": "emote-pose1", "dur": 2, "ar": ["غمز"]},
+            "EmotePunkguitar": {"id": "emote-punkguitar", "dur": 9, "ar": ["قيتار_بانك", "جيتار"]},
+            "SingAlong": {"id": "idle_singing", "dur": 9.5, "ar": ["غناء", "اغنية"]},
+            "ACasualDance": {"id": "idle-dance-casual", "dur": 8.5, "ar": ["رقص_عادي"]},
+            "Confusion": {"id": "emote-confused", "dur": 8, "ar": ["حيرة", "محتار"]},
+            "RaiseTheRoof": {"id": "emoji-celebrate", "dur": 3, "ar": ["سقف", "رفع_السقف"]},
+            "SaunterSway": {"id": "dance-anime", "dur": 8, "ar": ["انمي", "رقص_انمي"]},
+            "SwordFight": {"id": "emote-swordfight", "dur": 5, "ar": ["سيف", "قتال"]},
+            "BashfulBlush": {"id": "emote-shy2", "dur": 4.5, "ar": ["خجل", "استحياء"]},
+            "SaySoDance": {"id": "idle-dance-tiktok4", "dur": 15, "ar": ["سي_سو", "تيكتوك4"]},
+            "DontStartNow": {"id": "dance-tiktok2", "dur": 10, "ar": ["تيكتوك2"]},
+            "Model": {"id": "emote-model", "dur": 6, "ar": ["موديل", "عارض"]},
+            "Charging": {"id": "emote-charging", "dur": 8, "ar": ["شحن", "طاقة"]},
+            "DoTheWorm": {"id": "emote-snake", "dur": 5, "ar": ["دودة", "ثعبان"]},
+            "RussianDance": {"id": "dance-russian", "dur": 10.25, "ar": ["رقص_روسي", "روسي"]},
+            "UWUMood": {"id": "idle-uwu", "dur": 24, "ar": ["يو_دبليو_يو"]},
+            "Clap": {"id": "emoji-clapping", "dur": 2, "ar": ["تصفيقة"]},
+            "Happy": {"id": "emote-happy", "dur": 2, "ar": ["سعيد", "فرحان"]},
+            "DanceWrong": {"id": "dance-wrong", "dur": 12, "ar": ["رقص_غلط"]},
+            "TummyAche": {"id": "emoji-gagging", "dur": 5, "ar": ["مغص", "بطن"]},
+            "SavageDance": {"id": "dance-tiktok8", "dur": 10, "ar": ["سافج", "وحشي"]},
+            "KPopDance": {"id": "dance-blackpink", "dur": 6.5, "ar": ["كيبوب"]},
+            "PennysDance": {"id": "dance-pennywise", "dur": 0.5, "ar": ["بيني"]},
+            "Bow": {"id": "emote-bow", "dur": 3, "ar": ["انحناء", "انحناءة"]},
+            "Curtsy": {"id": "emote-curtsy", "dur": 2, "ar": ["تنوره", "انحناءه"]},
+            "SnowballFight": {"id": "emote-snowball", "dur": 5, "ar": ["ثلج", "كرة_ثلج"]},
+            "SnowAngel": {"id": "emote-snowangel", "dur": 6, "ar": ["ملاك_ثلج"]},
+            "Telekinesis": {"id": "emote-telekinesis", "dur": 10, "ar": ["تحريك_عقلي"]},
+            "Maniac": {"id": "emote-maniac", "dur": 4.5, "ar": ["مجنون", "جنون"]},
+            "EnergyBall": {"id": "emote-energyball", "dur": 7, "ar": ["كرة_طاقة"]},
+            "FroggieHop": {"id": "demote-frog", "dur": 14, "ar": ["ضفدع", "نط_ضفدع"]},
+            "Sit": {"id": "idle-loop-sitfloor", "dur": 22, "ar": ["جلوس", "اجلس", "قعود"]},
+            "Hyped": {"id": "emote-hyped", "dur": 7, "ar": ["حماس", "متحمس"]},
+            "JingleHop": {"id": "dance-jinglebell", "dur": 10.5, "ar": ["جنقل", "عيد_الميلاد"]},
+            "BitNervous": {"id": "idle-nervous", "dur": 21, "ar": ["عصبي", "توتر"]},
+            "GottaGo": {"id": "idle-toilet", "dur": 31.5, "ar": ["حمام", "لازم_اروح"]},
+            "ZeroGravity": {"id": "emote-astronaut", "dur": 13, "ar": ["فضاء", "رائد"]},
+            "Timejump": {"id": "emote-timejump", "dur": 4, "ar": ["قفز_زمني"]},
+            "GroovyPenguin": {"id": "dance-pinguin", "dur": 11, "ar": ["بطريق", "بنغوين"]},
+            "CreepyPuppet": {"id": "dance-creepypuppet", "dur": 6, "ar": ["دمية_مخيفة"]},
+            "EmoteGravity": {"id": "emote-gravity", "dur": 8, "ar": ["جاذبية"]},
+            "ZombieRun": {"id": "emote-zombierun", "dur": 9, "ar": ["ركض_زومبي"]},
+            "Enthused": {"id": "idle-enthusiastic", "dur": 15, "ar": ["متحمس_جدا", "حماسة"]},
+            "KawaiiGoGo": {"id": "dance-kawai", "dur": 10, "ar": ["كاواي"]},
+            "Repose": {"id": "sit-relaxed", "dur": 29, "ar": ["استرخاء", "راحة"]},
+            "Shy": {"id": "emote-shy", "dur": 4, "ar": ["خجول", "استحي"]},
+            "No": {"id": "emote-no", "dur": 2, "ar": ["لا", "رفض"]},
+            "Sad": {"id": "emote-sad", "dur": 4.5, "ar": ["حزين", "زعلان", "حزن"]},
+            "Yes": {"id": "emote-yes", "dur": 2, "ar": ["نعم", "اي", "موافق"]},
+            "Hello": {"id": "emote-hello", "dur": 2.5, "ar": ["مرحبا", "هلا", "اهلا"]},
+            "Tired": {"id": "emote-tired", "dur": 4, "ar": ["تعبان", "تعب"]},
+            "Angry": {"id": "emoji-angry", "dur": 5, "ar": ["غاضب", "معصب", "غضب"]},
+            "ThumbsUp": {"id": "emoji-thumbsup", "dur": 2, "ar": ["ابهام", "ممتاز"]},
+            "Stargazing": {"id": "emote-stargazer", "dur": 7, "ar": ["نجوم", "تامل_نجوم"]},
+            "AirGuitar": {"id": "idle-guitar", "dur": 12, "ar": ["قيتار", "جيتار_هوائي"]},
+            "Revelations": {"id": "emote-headblowup", "dur": 11, "ar": ["صدمة", "انفجار_راس"]},
+            "WatchYourBack": {"id": "emote-creepycute", "dur": 7, "ar": ["انتبه", "خلف"]},
+            "Arabesque": {"id": "emote-pose10", "dur": 3.5, "ar": ["ارابيسك"]},
+            "PartyTime": {"id": "emote-celebrate", "dur": 3, "ar": ["حفلة", "احتفال"]},
+            "IceSkating": {"id": "emote-iceskating", "dur": 7, "ar": ["تزلج_جليد"]},
+            "ReadyToRumble": {"id": "emote-boxer", "dur": 5, "ar": ["ملاكمة", "بوكس"]},
+            "Scritchy": {"id": "idle-wild", "dur": 25, "ar": ["حكة", "هرش"]},
+            "ThisIsForYou": {"id": "emote-gift", "dur": 5, "ar": ["هدية", "هديه"]},
+            "PushIt": {"id": "dance-employee", "dur": 6, "ar": ["دفع", "ادفع"]},
+            "BigSurprise": {"id": "emote-pose6", "dur": 5, "ar": ["مفاجأة", "مفاجاة"]},
+            "SweetLittleMoves": {"id": "dance-touch", "dur": 11, "ar": ["حركات_حلوة"]},
+            "CelebrationStep": {"id": "emote-celebrationstep", "dur": 3, "ar": ["خطوة_احتفال"]},
+            "Launch": {"id": "emote-launch", "dur": 9, "ar": ["اطلاق", "انطلاق"]},
+            "CuteSalute": {"id": "emote-cutesalute", "dur": 2.5, "ar": ["تحية_لطيفة"]},
+            "AtAttention": {"id": "emote-salute", "dur": 3, "ar": ["تحية", "سلام"]},
+            "WopDance": {"id": "dance-tiktok11", "dur": 9, "ar": ["ووب", "تيكتوك11"]},
+            "DitzyPose": {"id": "emote-pose9", "dur": 4, "ar": ["بوز_دتزي"]},
+            "SweetSmooch": {"id": "emote-kissing", "dur": 5, "ar": ["بوسه_حلوة"]},
+            "FairyFloat": {"id": "idle-floating", "dur": 24, "ar": ["طيران_خيالي", "جنية"]},
+            "FairyTwirl": {"id": "emote-looping", "dur": 7, "ar": ["دوران_جنية"]},
+            "Casting": {"id": "fishing-cast", "dur": 1, "ar": ["صيد_رمي"]},
+            "NowWeWait": {"id": "fishing-idle", "dur": 15, "ar": ["انتظار_صيد"]},
+            "MiningMine": {"id": "mining-mine", "dur": 3, "ar": ["تعدين"]},
+            "LandingAFish": {"id": "fishing-pull", "dur": 1, "ar": ["سحب_سمكة"]},
+            "WeHaveAStrike": {"id": "fishing-pull-small", "dur": 1, "ar": ["سمكة_صغيرة"]},
+            "MiningSuccess": {"id": "mining-success", "dur": 3, "ar": ["تعدين_ناجح"]},
+            "IgnitionBoost": {"id": "hcc-jetpack", "dur": 19, "ar": ["جت_باك", "صاروخ"]},
+            "Rest": {"id": "sit-open", "dur": 26.025963, "ar": ["ريست", "راحه"]},
+            "ريست": {"id": "sit-open", "dur": 26.025963, "ar": ["ريست", "راحه"]},
+            "Aerobics": {"id": "idle-loop-aerobics", "dur": 8, "ar": ["ايروبكس", "رياضه"]},
+            "Amused": {"id": "emote-laughing2", "dur": 5, "ar": ["مستمتع", "ضحك2"]},
+            "Arrogance": {"id": "emoji-arrogance", "dur": 6, "ar": ["غرور", "تكبر"]},
+            "Attentive": {"id": "idle_layingdown", "dur": 24, "ar": ["منتبه", "مستلقي"]},
+            "BlastOff": {"id": "emote-disappear", "dur": 6, "ar": ["اختفاء", "انطلق"]},
+            "Boo": {"id": "emote-boo", "dur": 4, "ar": ["بوو", "تخويف"]},
+            "Cheer": {"id": "dance-cheerleader", "dur": 17, "ar": ["تشجيع"]},
+            "CozyNap": {"id": "idle-floorsleeping", "dur": 13, "ar": ["قيلولة", "نوم_ارض"]},
+            "Dab": {"id": "emote-dab", "dur": 2, "ar": ["داب"]},
+            "DuckWalk": {"id": "dance-duckwalk", "dur": 11, "ar": ["مشي_بطة", "بطة"]},
+            "ElbowBump": {"id": "emote-elbowbump", "dur": 3, "ar": ["كوع"]},
+            "FallingApart": {"id": "emote-apart", "dur": 4, "ar": ["تفكك", "انهيار"]},
+            "Fighter": {"id": "idle-fighter", "dur": 17, "ar": ["مقاتل"]},
+            "FruityDance": {"id": "dance-fruity", "dur": 16, "ar": ["رقص_فواكه"]},
+            "GangnamStyle": {"id": "emote-gangnam", "dur": 6.5, "ar": ["جانجنام", "كانكنام"]},
+            "Gasp": {"id": "emoji-scared", "dur": 2.5, "ar": ["خوف", "فزع"]},
+            "Ghost": {"id": "emoji-ghost", "dur": 3, "ar": ["شبح"]},
+            "GhostFloat": {"id": "emote-ghost-idle", "dur": 19, "ar": ["جوست", "شبح_طائر"]},
+            "جوست": {"id": "emote-ghost-idle", "dur": 19, "ar": ["جوست", "شبح_طائر"]},
+            "GimmeAttention": {"id": "emote-attention", "dur": 4, "ar": ["انتباه", "اهتمام"]},
+            "Handstand": {"id": "emote-handstand", "dur": 3.5, "ar": ["وقوف_يدين"]},
+            "HarlemShake": {"id": "emote-harlemshake", "dur": 13, "ar": ["هارلم_شيك"]},
+            "HipShake": {"id": "dance-hipshake", "dur": 12, "ar": ["هز_وسط"]},
+            "ImaginaryJetpack": {"id": "emote-jetpack", "dur": 16, "ar": ["جت_باك_خيالي"]},
+            "Irritated": {"id": "idle-angry", "dur": 24, "ar": ["متضايق"]},
+            "KarmaDance": {"id": "dance-wild", "dur": 13, "ar": ["كارما", "رقص_بري"]},
+            "LaidBack": {"id": "sit-open", "dur": 25, "ar": ["مسترخي"]},
+            "Levitate": {"id": "emoji-halo", "dur": 5.5, "ar": ["تحليق_هالة", "هالة"]},
+            "LoveFlutter": {"id": "emote-hearteyes", "dur": 3.5, "ar": ["عيون_قلب", "حب_عيون"]},
+            "Lying": {"id": "emoji-lying", "dur": 5.5, "ar": ["كذب", "كذاب"]},
+            "Magnetic": {"id": "dance-tiktok14", "dur": 9.5, "ar": ["مغناطيس"]},
+            "MindBlown": {"id": "emoji-mind-blown", "dur": 2, "ar": ["عقل_منفجر", "ذهول"]},
+            "MoonlitHowl": {"id": "emote-howl", "dur": 5.5, "ar": ["عواء"]},
+            "Moonwalk": {"id": "emote-gordonshuffle", "dur": 7.5, "ar": ["مون_ووك", "مونووك"]},
+            "NightFever": {"id": "emote-nightfever", "dur": 5, "ar": ["حمى_الليل"]},
+            "NinjaRun": {"id": "emote-ninjarun", "dur": 4, "ar": ["نينجا", "ركض_نينجا"]},
+            "NocturnalHowl": {"id": "idle-howl", "dur": 30, "ar": ["عواء_ليلي"]},
+            "OrangeJuiceDance": {"id": "dance-orangejustice", "dur": 5.5, "ar": ["عصير_برتقال"]},
+            "Panic": {"id": "emote-panic", "dur": 2, "ar": ["هلع", "ذعر"]},
+            "Peekaboo": {"id": "emote-peekaboo", "dur": 3.5, "ar": ["بيكابو", "استغماية"]},
+            "PissedOff": {"id": "emote-frustrated", "dur": 4.5, "ar": ["زهق", "منرفز"]},
+            "PossessedPuppet": {"id": "emote-puppet", "dur": 16, "ar": ["دمية"]},
+            "Punch": {"id": "emoji-punch", "dur": 1, "ar": ["لكمة", "لكم"]},
+            "PushUps": {"id": "dance-aerobics", "dur": 8, "ar": ["تمارين", "جيم", "رياضة"]},
+            "Rainbow": {"id": "emote-rainbow", "dur": 2.5, "ar": ["قوس_قزح"]},
+            "Relaxed": {"id": "idle_layingdown2", "dur": 20.5, "ar": ["استرخاء2"]},
+            "Relaxing": {"id": "idle-floorsleeping2", "dur": 16, "ar": ["استرخاء_نوم"]},
+            "Renegade": {"id": "idle-dance-tiktok7", "dur": 12, "ar": ["رينيقيد"]},
+            "Revival": {"id": "emote-death", "dur": 6, "ar": ["احياء", "موت"]},
+            "RingOnIt": {"id": "dance-singleladies", "dur": 20.5, "ar": ["خاتم", "سنقل_ليديز"]},
+            "ROFL": {"id": "emote-rofl", "dur": 6, "ar": ["ضحك_تدحرج"]},
+            "Robot": {"id": "emote-robot", "dur": 7, "ar": ["روبوت", "ربوت"]},
+            "RockOut": {"id": "dance-metal", "dur": 14.5, "ar": ["روك", "ميتال"]},
+            "Roll": {"id": "emote-roll", "dur": 3, "ar": ["تدحرج"]},
+            "SecretHandshake": {"id": "emote-secrethandshake", "dur": 3, "ar": ["مصافحة_سرية"]},
+            "Shrink": {"id": "emote-shrink", "dur": 8, "ar": ["تقلص", "صغر"]},
+            "Slap": {"id": "emote-slap", "dur": 2, "ar": ["صفعة", "كف"]},
+            "Smoothwalk": {"id": "dance-smoothwalk", "dur": 5.5, "ar": ["مشي_ناعم"]},
+            "Stinky": {"id": "emoji-poop", "dur": 4, "ar": ["نتن", "ريحة"]},
+            "SuperKick": {"id": "emote-kicking", "dur": 4.5, "ar": ["رفسة", "رفس"]},
+            "SuperRun": {"id": "emote-superrun", "dur": 6, "ar": ["ركض_سريع"]},
+            "TapDance": {"id": "emote-tapdance", "dur": 10.5, "ar": ["رقص_تاب"]},
+            "TapLoop": {"id": "idle-loop-tapdance", "dur": 6, "ar": ["تاب_لوب"]},
+            "Trampoline": {"id": "emote-trampoline", "dur": 5, "ar": ["ترامبولين", "نطاطة"]},
+            "ZombieDance": {"id": "dance-zombie", "dur": 12, "ar": ["رقص_زومبي"]},
+            "Annoyed": {"id": "idle-loop-annoyed", "dur": 16.5, "ar": ["منزعج2", "ازعاج"]},
+            "Bummed": {"id": "idle-loop-sad", "dur": 28, "ar": ["محبط", "كئيب"]},
+            "BunnyHop": {"id": "emote-bunnyhop", "dur": 11, "ar": ["ارنب", "نط_ارنب"]},
+            "Chillin": {"id": "idle-loop-happy", "dur": 18, "ar": ["رايق", "مرتاح"]},
+            "Clumsy": {"id": "emote-fail2", "dur": 6, "ar": ["اخرق", "وقعة"]},
+            "Collapse": {"id": "emote-death2", "dur": 4, "ar": ["انهيار2", "سقوط"]},
+            "Cold": {"id": "emote-cold", "dur": 3, "ar": ["برد", "بارد"]},
+            "Disco": {"id": "emote-disco", "dur": 4.5, "ar": ["ديسكو"]},
+            "Embarrassed": {"id": "emote-embarrassed", "dur": 7, "ar": ["محرج", "احراج"]},
+            "Exasperated": {"id": "emote-exasperated", "dur": 2, "ar": ["مستاء"]},
+            "EyeRoll": {"id": "emoji-eyeroll", "dur": 2.5, "ar": ["تدوير_عيون"]},
+            "FacePalm": {"id": "emote-exasperatedb", "dur": 2, "ar": ["فيس_بالم"]},
+            "Faint": {"id": "emote-fainting", "dur": 17.5, "ar": ["اغماء", "اغماءة"]},
+            "FaintDrop": {"id": "emote-deathdrop", "dur": 3, "ar": ["سقوط_مفاجئ"]},
+            "Fall": {"id": "emote-fail1", "dur": 5.5, "ar": ["وقوع", "طيحة"]},
+            "Fatigued": {"id": "idle-loop-tired", "dur": 21, "ar": ["ارهاق", "مرهق"]},
+            "FeelTheBeat": {"id": "idle-dance-headbobbing", "dur": 24.5, "ar": ["ايقاع", "هز_راس"]},
+            "FireballLunge": {"id": "emoji-hadoken", "dur": 2, "ar": ["كرة_نار", "هادوكن"]},
+            "GiveUp": {"id": "emoji-give-up", "dur": 5, "ar": ["استسلام", "يأس"]},
+            "HandsInTheAir": {"id": "dance-handsup", "dur": 21.5, "ar": ["ايدين_فوق"]},
+            "HeartHands": {"id": "emote-heartfingers", "dur": 3.5, "ar": ["قلب_بالايد"]},
+            "HeroPose": {"id": "idle-hero", "dur": 21, "ar": ["بطل", "سوبرمان"]},
+            "HomeRun": {"id": "emote-baseball", "dur": 6.5, "ar": ["بيسبول"]},
+            "HugYourself": {"id": "emote-hugyourself", "dur": 4.5, "ar": ["حضن_نفسك"]},
+            "IBelieveICanFly": {"id": "emote-wings", "dur": 12.5, "ar": ["اجنحة", "طيران"]},
+            "Jump": {"id": "emote-jumpb", "dur": 3, "ar": ["قفز", "نط"]},
+            "JudoChop": {"id": "emote-judochop", "dur": 2, "ar": ["جودو", "كاراتيه"]},
+            "LevelUp": {"id": "emote-levelup", "dur": 5.5, "ar": ["ترقية", "ليفل_اب"]},
+            "MonsterFail": {"id": "emote-monster_fail", "dur": 4, "ar": ["وحش_فشل"]},
+            "Naughty": {"id": "emoji-naughty", "dur": 4, "ar": ["شقي", "مشاغب"]},
+            "PartnerHeartArms": {"id": "emote-heartshape", "dur": 5.5, "ar": ["قلب_ايدين"]},
+            "PartnerHug": {"id": "emote-hug", "dur": 3, "ar": ["حضن", "عناق"]},
+            "Peace": {"id": "emote-peace", "dur": 5, "ar": ["سلام_علامة", "بيس"]},
+            "Point": {"id": "emoji-there", "dur": 1.5, "ar": ["اشارة", "هناك"]},
+            "Ponder": {"id": "idle-lookup", "dur": 21, "ar": ["تفكير", "تأمل"]},
+            "Posh": {"id": "idle-posh", "dur": 21, "ar": ["فخم", "اناقة"]},
+            "PoutyFace": {"id": "idle-sad", "dur": 24, "ar": ["زعل", "وجه_حزين"]},
+            "Pray": {"id": "emoji-pray", "dur": 4, "ar": ["دعاء", "صلاة"]},
+            "Proposing": {"id": "emote-proposing", "dur": 4, "ar": ["خطبة", "عرض_زواج"]},
+            "RopePull": {"id": "emote-ropepull", "dur": 8, "ar": ["سحب_حبل"]},
+            "Sick": {"id": "emoji-sick", "dur": 4.5, "ar": ["مريض"]},
+            "Sleepy": {"id": "idle-sleep", "dur": 38, "ar": ["نوم", "نعسان"]},
+            "Smirk": {"id": "emoji-smirking", "dur": 4, "ar": ["ابتسامة_ماكرة"]},
+            "Sneeze": {"id": "emoji-sneeze", "dur": 2.5, "ar": ["عطس", "عطاس"]},
+            "Sob": {"id": "emoji-crying", "dur": 3, "ar": ["بكاء", "بكى"]},
+            "SplitsDrop": {"id": "emote-splitsdrop", "dur": 4, "ar": ["سبليت", "شقلبة"]},
+            "Stunned": {"id": "emoji-dizzy", "dur": 3.5, "ar": ["مذهول", "دوخة"]},
+            "SumoFight": {"id": "emote-sumo", "dur": 10, "ar": ["سومو"]},
+            "SuperPunch": {"id": "emote-superpunch", "dur": 3, "ar": ["لكمة_خارقة"]},
+            "Theatrical": {"id": "emote-theatrical", "dur": 8, "ar": ["مسرحي", "تمثيل"]},
+            "Think": {"id": "emote-think", "dur": 3, "ar": ["تفكير2", "فكر"]},
+            "ThumbSuck": {"id": "emote-suckthumb", "dur": 3.5, "ar": ["مص_ابهام"]},
+            "VogueHands": {"id": "dance-voguehands", "dur": 8.5, "ar": ["فوغ"]},
+            "WiggleDance": {"id": "dance-sexy", "dur": 11.5, "ar": ["هز", "رقص_مثير"]},
+            "Zombie": {"id": "idle_zombie", "dur": 28, "ar": ["زومبي"]},
+            "DanceShuffle": {"id": "dance-shuffle", "dur": 7, "ar": ["شافل2"]},
+            "EmoteConfused2": {"id": "emote-confused2", "dur": 7, "ar": ["حيرة2"]},
+            "EmoteFail3": {"id": "emote-fail3", "dur": 6, "ar": ["فشل"]},
+            "EmoteReceiveDisappointed": {"id": "emote-receive-disappointed", "dur": 5.5, "ar": ["خيبة_امل"]},
+            "EmoteReceiveHappy": {"id": "emote-receive-happy", "dur": 4, "ar": ["استلام_سعيد"]},
+            "IdleCold": {"id": "idle-cold", "dur": 10, "ar": ["برد_شديد"]},
+            "IdleTough": {"id": "idle_tough", "dur": 10, "ar": ["قوي", "صلب"]},
+            "MiningFail": {"id": "mining-fail", "dur": 2.5, "ar": ["تعدين_فاشل"]},
+            "RunVertical": {"id": "run-vertical", "dur": 1, "ar": ["ركض_عمودي"]},
+            "Shy2": {"id": "emote-shy2", "dur": 4.5, "ar": ["خجل2", "شاي2"]},
+            "swag": {"id": "dance-swagbounce", "dur": 10, "ar": ["سواج", "سواغ"]},
+            "floss": {"id": "dance-floss", "dur": 21, "ar": ["فلوس", "خيط"]},
+            "PopularVibe": {"id": "dance-popularvibe", "dur": 10, "ar": ["بوبيولار", "فايب"]},
+            "Twerk": {"id": "dance-twerk", "dur": 10, "ar": ["تويرك", "تيرك"]},
+            "Griddy": {"id": "dance-griddy", "dur": 10, "ar": ["جريدي", "قهر"]},
+            "TrueHeart": {"id": "dance-true-heart", "dur": 10, "ar": ["قلب_حقيقي", "قلب2"]},
+        }
+        
+        
+        #  نظام التفاعلات (تفاعل موجه: لاعب -> لاعب آخر)
+        # الصيغة: المفتاح هو اسم التفاعل بالانجليزي وعربي
+        # "command": {"id": "action_emote", "target_id": "reaction_emote", "ar": ["اسم_عربي"], "en": ["english_name"]}
+        # 🤼 نظام التفاعلات (تفاعل موجه: لاعب -> لاعب آخر)
+        # الصيغة: المفتاح هو اسم التفاعل بالانجليزي وعربي
+        # "command": {"id": "action_emote", "target_id": "reaction_emote", "ar": ["اسم_عربي"], "en": ["english_name"], "dur": duration}
+        self.interactions = {
+            "slap": {"id": "emote-slap", "target_id": "emote-fail2", "ar": ["كف", "صفعة"], "en": ["slap"], "dur": 2},
+            "kiss": {"id": "emote-kiss", "target_id": "emote-kissing", "ar": ["بوس", "قبلة"], "en": ["kiss"], "dur": 2},
+            "hug": {"id": "emote-hug", "target_id": "emote-hug", "ar": ["حضن", "عناق"], "en": ["hug"], "dur": 3},
+            "punch": {"id": "emote-superpunch", "target_id": "emote-death2", "ar": ["لكم", "بوكس"], "en": ["punch"], "dur": 3},
+            "kick": {"id": "emote-kicking", "target_id": "emote-fail1", "ar": ["ركل", "رفس"], "en": ["kick"], "dur": 4.5},
+            "stab": {"id": "emote-swordfight", "target_id": "emote-death", "ar": ["طعن", "سيف"], "en": ["stab"], "dur": 5},
+            "shoot": {"id": "emote-energyball", "target_id": "emote-deathdrop", "ar": ["اطلاق", "نار"], "en": ["shoot"], "dur": 7},
+            "bite": {"id": "emote-zombierun", "target_id": "emote-fainting", "ar": ["عض", "عضة"], "en": ["bite"], "dur": 5},
+            "worship": {"id": "emote-bow", "target_id": "emote-curtsy", "ar": ["احترام", "تقدير"], "en": ["worship"], "dur": 3},
+            "scare": {"id": "emote-boo", "target_id": "emoji-scared", "ar": ["تخويف", "بو"], "en": ["scare"], "dur": 4},
+            "laugh": {"id": "emote-laughing", "target_id": "emote-embarrassed", "ar": ["ضحك", "سخرية"], "en": ["laugh_at"], "dur": 2.5},
+            "flirt": {"id": "emote-heartfingers", "target_id": "emote-shy2", "ar": ["مغازلة", "غزل"], "en": ["flirt"], "dur": 3.5},
+            "highfive": {"id": "emote-celebrate", "target_id": "emote-celebrate", "ar": ["كفك", "هاي فايف"], "en": ["highfive"], "dur": 3},
+            "propose": {"id": "emote-proposing", "target_id": "emote-superpose", "ar": ["زواج", "خطبة"], "en": ["propose"], "dur": 4},
+        }
+        
+        # إنشاء قائمة بالأرقام (قبل التنظيف) للحفاظ على ثبات الأرقام (مثل 210 لـ Proposing)
+        self.emote_list = [None] + list(self.emotes.values())
 
-    async def on_start(self, ambient):
-        global _loop, _bot_ref
-        _loop = asyncio.get_event_loop()
+        # 🧹 تنظيف التضارب: حذف أي رقصة عادية لها نفس اسم تفاعل (للبحث النصي فقط)
+        for interaction_name, interaction_data in self.interactions.items():
+            # حذف الاسم الإنجليزي
+            if interaction_name in self.emotes:
+                del self.emotes[interaction_name]
+            
+            # فحص الأسماء العربية في الرقصات
+            keys_to_remove = []
+            for emote_key, emote_data in self.emotes.items():
+                if any(ar in emote_data.get("ar", []) for ar in interaction_data["ar"]):
+                   keys_to_remove.append(emote_key)
+            
+            for k in keys_to_remove:
+                del self.emotes[k]
 
-        old = _bot_ref
-        if old and old is not self:
-            old._connected = False
-            await old._cancel_task()
-            if old._watchdog and not old._watchdog.done():
-                old._watchdog.cancel()
+        # قائمة لتتبع المستخدمين الراقصين (لإيقافهم عند كتابة 0)
 
-        _bot_ref        = self
-        self._connected = True
-        log.info("✅ متصل")
+        
+                # قائمة لتتبع المستخدمين الراقصين (لإيقافهم عند كتابة 0)
+        self.dancing_users = {}
+        self.active_dance_requests = {} # لتتبع آخر طلب رقص لكل مستخدم ومنع التداخل
+        
+        # 💝 نظام الرياكشنات الرسمية من Highrise SDK
+        # الأنواع المتاحة: "clap", "heart", "thumbs", "wave", "wink"
+        self.reactions = {
+            "heart": {"ar": ["قلب", "ق", "حب", "ح", "h"]},
+            "thumbs": {"ar": ["اعجاب", "ا", "لايك", "ثامز", "thumbs"]},
+            "clap": {"ar": ["تصفيق", "ت", "كلاب", "clap"]},
+            "wave": {"ar": ["تلويح", "تل", "باي", "wave"]},
+            "wink": {"ar": ["غمزة", "غ", "وينك", "wink"]},
+        }
 
-        await self._cancel_task()
-        self._playing = False
-        BROADCAST.skip()
-        await asyncio.sleep(0.3)
 
-        if self._watchdog and not self._watchdog.done():
-            self._watchdog.cancel()
-        self._watchdog = asyncio.create_task(self._watchdog_loop())
+        
+        # البوت يرقص تلقائياً
+        self.bot_dancing = False
+        self.bot_dance_task = None
+        
+        # نظام إعادة الاتصال
+        self.connection_active = True
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 999  # محاولات غير محدودة تقريباً
 
-        if QUEUE.empty():
-            nxt = AUTOPLAY.next_song()
-            if nxt: QUEUE.add(nxt, "🤖 تلقائي")
 
-        await self._chat("🎙️ Radio v10 جاهز على Render! ▶️")
-        self._task = asyncio.create_task(self._run_queue())
+    def load_config(self):
+        """Load bot configuration from JSON file"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, "r", encoding='utf-8') as f:
+                    config = json.load(f)
+                    
+                    # تحميل الموقع
+                    pos = config.get("bot_position")
+                    if pos:
+                        self.bot_position = Position(pos["x"], pos["y"], pos["z"], pos.get("facing", "FrontRight"))
+                    
+                    # تحميل الملاك والمشرفين (إذا وجدت)
+                    self.admins = config.get("admins", self.admins)
+                    self.owners = config.get("owners", self.owners)
+                    self.vip_users = config.get("vip_users", [])
+                    self.distinguished_users = config.get("distinguished_users", [])
+                    
+                    # تحميل الترحيبات الخاصة
+                    self.custom_welcomes = config.get("custom_welcomes", {})
+                    
+                    # تحميل إعدادات الترحيب العام
+                    self.welcome_message = config.get("welcome_message", self.welcome_message)
+                    self.welcome_public = config.get("welcome_public", self.welcome_public)
+                    
+                print("Configuration loaded successfully")
+        except Exception as e:
+            print(f"Error loading config: {e}")
+
+    def save_config(self):
+        """Save bot configuration to JSON file"""
+        try:
+            config = {
+                "bot_position": {
+                    "x": self.bot_position.x,
+                    "y": self.bot_position.y,
+                    "z": self.bot_position.z,
+                    "facing": self.bot_position.facing
+                },
+                "admins": self.admins,
+                "owners": self.owners,
+                "vip_users": self.vip_users,
+                "distinguished_users": self.distinguished_users,
+                "custom_welcomes": self.custom_welcomes,
+                "welcome_message": self.welcome_message,
+                "welcome_public": self.welcome_public
+            }
+            with open(self.config_file, "w", encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=4)
+            print("Configuration saved successfully")
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
+    async def safe_chat(self, msg: str):
+        try:
+            # Highrise chat limit is around 255 characters
+            if len(msg) > 255: msg = msg[:252] + "..."
+            await self.highrise.chat(msg)
+        except: pass
+
+    async def safe_whisper(self, uid: str, msg: str):
+        try:
+            # Highrise whisper limit is around 255 characters
+            if len(msg) > 255: msg = msg[:252] + "..."
+            await self.highrise.send_whisper(uid, msg)
+        except: pass
+
+    async def on_start(self, session_metadata: SessionMetadata):
+        """When the bot starts"""
+        print(f"Bot connected to room as: {session_metadata.user_id}")
+        print(f"Room name: {session_metadata.room_info.room_name}")
+        
+        # إلغاء أي مهام سابقة لتجنب التكرار عند إعادة الاتصال
+        if hasattr(self, 'bot_dance_task') and self.bot_dance_task:
+            try:
+                self.bot_dance_task.cancel()
+            except: pass
+            self.bot_dance_task = None
+            
+        # إعادة تعيين حالة الاتصال
+        self.connection_active = True
+        self.reconnect_attempts = 0
+        
+        # Move bot with retry loop to avoid "Not in room" errors
+        max_retries = 6
+        for attempt in range(max_retries):
+            try:
+                wait_time = 3 if attempt == 0 else (2 + attempt)
+                if attempt > 0:
+                    print(f"Movement attempt {attempt + 1}/{max_retries} (waiting {wait_time}s)...")
+                await asyncio.sleep(wait_time)
+                
+                room_users = await self.highrise.get_room_users()
+                users_list = getattr(room_users, 'content', [])
+                bot_user = next((u for u, _ in users_list if u.id == self.highrise.my_id), None)
+                
+                if bot_user:
+                    print(f"Bot found in room. Moving to: {self.bot_position}")
+                    await self.highrise.teleport(bot_user.id, self.bot_position)
+                    break
+                else:
+                    if attempt > 1:
+                        print(f"Bot ID {self.highrise.my_id} not found in room users yet. Retrying...")
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    print("Could not move bot. Proceeding...")
+
+        # 👕 تعيين الملابس الجديدة (لبسة الصورة)
+        try:
+            outfit = [
+                Item(type="clothing", amount=1, id="body-flesh", active_palette=1),   # لون البشرة
+                Item(type="clothing", amount=1, id="hair_front-n_animecollection2018coolguyhair", active_palette=6),  # كريمي أبيض (اللون 6)
+                Item(type="clothing", amount=1, id="hair_back-n_animecollection2018coolguyhair", active_palette=6),   # كريمي أبيض (اللون 6)
+                Item(type="clothing", amount=1, id="eye-n_animecollection2018bishoneneyes"),                         # عيون انيمي
+                Item(type="clothing", amount=1, id="eyebrow-n_08"),                                # حواجب
+                Item(type="clothing", amount=1, id="nose-n_01"),                                   # أنف
+                Item(type="clothing", amount=1, id="mouth-n_01"),                                  # فم
+                Item(type="clothing", amount=1, id="fullsuit-n_eastershop2021overalls"),           # بدلة كاملة (الأوفيرول)
+                Item(type="clothing", amount=1, id="handbag-n_MothersDay2018bouquet"),             # باقة ورد
+                Item(type="clothing", amount=1, id="sock-n_seasonpass2026set3socks"),              # جوارب
+                Item(type="clothing", amount=1, id="shoes-n_swimwear2018whiteslides"),             # صندل أبيض
+            ]
+            
+            print("Trying to set final outfit...")
+            await self.highrise.set_outfit(outfit)
+            print("Set outfit command sent to server.")
+            
+        except Exception as e:
+            print(f"Error in on_start outfit: {e}")
+
+        # بدء رقص البوت التلقائي
+        if not self.bot_dancing:
+            self.bot_dancing = True
+            self.bot_dance_task = asyncio.create_task(self.bot_auto_dance())
+
+        # 💓 بدء نظام Keep-Alive
+        if not hasattr(self, '_keepalive_task') or self._keepalive_task is None or self._keepalive_task.done():
+            self._keepalive_task = asyncio.create_task(self._keep_alive_loop())
+            print("💓 Keep-Alive system started")
+
+
+    async def _keep_alive_loop(self):
+        """
+        💓 نظام Keep-Alive الداخلي الذكي
+        - يرسل طلب حقيقي لـ Highrise API كل 8 دقائق
+        - يبقي الـ event loop و WebSocket حياً
+        - لا يعتمد على HTTP خارجي بل على نفس اتصال البوت
+        """
+        print("💓 Keep-Alive loop running...")
+        while True:
+            try:
+                await asyncio.sleep(8 * 60)  # كل 8 دقائق (أقل من حد الـ 15)
+                
+                # طلب حقيقي لـ Highrise API — أذكى من أي self-ping
+                room_users = await self.highrise.get_room_users()
+                count = len(getattr(room_users, 'content', []))
+                print(f"💓 Keep-Alive OK | Users: {count} | {__import__('datetime').datetime.now().strftime('%H:%M:%S')}")
+                
+            except asyncio.CancelledError:
+                print("💓 Keep-Alive cancelled")
+                break
+            except Exception as e:
+                print(f"💓 Keep-Alive error (retrying in 30s): {e}")
+                await asyncio.sleep(30)
+
+    async def on_user_join(self, user: User, position: Position):
+        """When a new user joins"""
+        print(f"User joined: {user.username}")
+        
+        # Sending a welcome heart
+        try:
+            await self.highrise.react("heart", user.id)
+            print(f"Sent welcome heart to {user.username}")
+        except Exception as e:
+            print(f"Error sending welcome heart: {e}")
+        
+        # 🤖 البوت يرحب بالضيف (يقطع رقصة الفلوس ثم يعود لها)
+        try:
+            # 1. إيقاف رقصة الفلوس المؤقت
+            if self.bot_dance_task and not self.bot_dance_task.done():
+                self.bot_dance_task.cancel()
+            
+            # 2. البوت يقوم برقصة الترحيب (Wave)
+            welcome_emote_id = "emote-wave"  # رقم 13
+            welcome_duration = 2.5
+            
+            await self.highrise.send_emote(welcome_emote_id)
+            print(f"Bot welcomes {user.username}")
+            
+            # 3. انتظار انتهاء الترحيب
+            await asyncio.sleep(welcome_duration)
+            
+            # 4. العودة لرقصة الفلوس
+            self.bot_dance_task = asyncio.create_task(self.bot_auto_dance())
+            
+        except Exception as e:
+            print(f"Error in bot welcome: {e}")
+            # Try to resume dance in case of error
+            self.bot_dance_task = asyncio.create_task(self.bot_auto_dance())
+        
+        # --- ✨ نظام الترحيب الجديد ---
+        try:
+            # 1. إرسال الترحيب العام في الشات
+            if self.welcome_message and self.welcome_public:
+                await self.safe_chat(f"🎊 {self.welcome_message} @{user.username}")
+            
+            # 2. إرسال الترحيب الخاص في الهمس (قائمة الأوامر الأساسية)
+            commands_msg = f"🌿 نورت المنتجع يا @{user.username}!\n📖 اكتب help لمعرفة الأوامر المتاحة لك."
+            await self.safe_whisper(user.id, commands_msg)
+                
+        except Exception as e:
+            print(f"Error in welcome sequence: {e}")
+
+
+    async def on_user_leave(self, user: User):
+        """When a user leaves"""
+        print(f"User left: {user.username}")
+        
+        # مسح بيانات المستخدم من الذاكرة
+        if user.id in self.user_messages:
+            del self.user_messages[user.id]
+        # ✅ الكتم يبقى حتى لو اللاعب طلع ورجع (لا نحذف muted_users)
+        # ✅ التجميد يبقى حتى لو اللاعب طلع ورجع
+        # if user.id in self.frozen_users:
+        #     del self.frozen_users[user.id]
+        if user.id in self.dancing_users:
+            self.dancing_users[user.id].cancel()
+            del self.dancing_users[user.id]
+        
+
+    
+    def _get_floor_name(self, y: float, z: float = 0) -> str | None:
+        """تحديد اسم الطابق (أرضي < 4، أول < 10، الطابق الثاني و VIP > 10)"""
+        if y < 4.0:
+            return "ground"
+        elif 4.0 <= y < 10.0:
+            return "floor1"
+        elif y >= 10.0:
+            # تمييز VIP بناءً على Z (VIP قريب من الصفر في Z حسب الإحداثيات الجديدة)
+            if z < 3.0:
+                return "vip"
+            else:
+                return "floor2"
+        return None
+
+    async def on_user_move(self, user: User, destination: Position | AnchorPosition):
+        """عند تحرك مستخدم - للتحقق من التجميد والانتقال الذكي بين الطوابق"""
+        # إذا كان المستخدم مجمد، نعيده لموقعه السابق
+        if user.id in self.frozen_users:
+            frozen_pos = self.frozen_users[user.id]
+            await self.highrise.teleport(user.id, frozen_pos)
+            return
+        
+        # نظام الانتقال الذكي بين الطوابق
+        if not isinstance(destination, Position):
+            return
+            
+        try:
+            # تحديد الطابق الحالي والمستهدف
+            current_floor = self.user_floors.get(user.id, "ground")
+            target_floor = self._get_floor_name(destination.y, destination.z)
+            
+            facing = getattr(destination, 'facing', 'FrontRight') or 'FrontRight'
+            print(f"Movement {user.username}: current={current_floor}, target={target_floor}")
+            
+            if target_floor is None:
+                return
+            
+            # فقط ننقل إذا كان الطابق المستهدف مختلف عن الحالي
+            if target_floor != current_floor:
+                # التحقق من صلاحية طابق VIP (فقط إذا كان يحاول الدخول إليه من طابق آخر)
+                if target_floor == "vip" and current_floor != "vip":
+                    is_admin = await self.is_admin(user)
+                    if not is_admin:
+                        # إرسال اللاعب للطابق الأرضي إذا لم يكن مشرفاً وحاول الدخول للـ VIP
+                        await self.highrise.teleport(user.id, self.floors["ground"])
+                        self.user_floors[user.id] = "ground"
+                        await self.highrise.send_whisper(user.id, "❌ طابق VIP مخصص للمشرفين فقط!")
+                        return
+
+                # تحديث الطابق الحالي فوراً لمنع التكرار
+                self.user_floors[user.id] = target_floor
+                
+                floor_labels = {
+                    "ground": "🏢 الطابق الأرضي",
+                    "floor1": "🏬 فوق",
+                    "floor2": "🏬 فوق2",
+                    "vip": "💎 VIP"
+                }
+
+                floor_y = self.floors[target_floor].y
+                
+                # الانتقال فوراً لنفس النقطة التي تم النقر عليها ولكن بارتفاع الطابق الصحيح
+                new_pos = Position(destination.x, floor_y, destination.z, facing)
+                print(f"Smart Teleport: {current_floor} -> {target_floor} (Target Y: {floor_y})")
+                await self.highrise.teleport(user.id, new_pos)
+                await self.highrise.send_whisper(user.id, f"✨ تم نقلك إلى {floor_labels[target_floor]}")
+            
+            # إذا كان في نفس الطابق ولكن الارتفاع غير صحيح (متعلق بالـ snap للجاذبية أو الطيران)
+            else:
+                floor_y = self.floors[target_floor].y
+                if abs(destination.y - floor_y) > 0.5:
+                    new_pos = Position(destination.x, floor_y, destination.z, facing)
+                    await self.highrise.teleport(user.id, new_pos)
+                    print(f"Snap Teleport on {target_floor}")
+            
+            # التأكد من تحديث الحالة دائماً في الذاكرة
+            self.user_floors[user.id] = target_floor
+            
+        except Exception as e:
+            print(f"Error in teleport system: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def on_chat(self, user: User, message: str):
-        msg    = message.strip()
-        if not msg.startswith("!"): return
-        parts  = msg.split(maxsplit=1)
-        cmd    = parts[0].lower()
-        arg    = parts[1].strip() if len(parts) > 1 else ""
-        is_adm = STATE.is_admin(user.username)
-
-        if cmd == "!help":
-            await self._chat(_HELP_ALL + (_HELP_ADMIN if is_adm else ""))
-            return
-
-        if cmd in ("!queue", "!q"):
-            s = STATE.get(); q = QUEUE.snap()
-            if not s and not q:
-                await self._chat("📋 القائمة فارغة."); return
-            lines = []
-            if s: lines.append(f"▶️ الآن: {s.title}")
-            if q:
-                lines.append(f"📋 ({len(q)}):")
-                for i, r in enumerate(q, 1):
-                    lines.append(f"  {i}. {r.query} — @{r.by}")
-            await self._chat("\n".join(lines))
-            return
-
-        if cmd == "!np":
-            s = STATE.get()
-            if not s:
-                await self._chat("⏸️ لا يوجد بث."); return
-            e = STATE.elapsed_s()
-            await self._chat(
-                f"🎵 {s.title}\n"
-                f"⏱️ {e//60}:{e%60:02d} / {s.dur_str}\n"
-                f"👤 @{s.by} | 👂 {RING.count()} مستمع")
-            return
-
-        if cmd == "!history":
-            h = STATE.get_history()
-            if not h:
-                await self._chat("🕒 لا يوجد سجل."); return
-            await self._chat(
-                "🕒 آخر الأغاني:\n" +
-                "\n".join(f"  {i+1}. {s.title}" for i, s in enumerate(h)))
-            return
-
-        if cmd == "!play":
-            if not arg:
-                await self._chat("❌ !play اسم الأغنية"); return
-            arg = arg[:80]
-            if not is_adm:
-                now  = time.time()
-                last = _rate.get(user.username.lower(), 0)
-                wait = PLAY_COOLDOWN - (now - last)
-                if wait > 0:
-                    await self._chat(f"⏳ @{user.username} انتظر {int(wait)+1}s")
-                    return
-                _rate[user.username.lower()] = now
-            err = QUEUE.add(arg, user.username)
-            if err:
-                await self._chat(err); return
-            pos = QUEUE.size()
-            if self._playing:
-                await self._chat(f"➕ {arg}\n👤 @{user.username} | 📋 موضعك: {pos}")
-            else:
-                await self._chat(f"🔍 جاري البحث: {arg}")
-                self._task = asyncio.create_task(self._run_queue())
-            return
-
-        if cmd == "!skip":
-            if not self._playing:
-                await self._chat("❌ لا يوجد بث."); return
-            now = time.time()
-            if now - _skip_cooldown[0] < 2.0: return
-            _skip_cooldown[0] = now
-            nxt = QUEUE.peek()
-            await self._chat(
-                f"⏭️ @{user.username} تخطى\n"
-                f"{'التالية: '+nxt.query if nxt else '📭 القائمة فارغة'}")
-            BROADCAST.skip()
-            return
-
-        if not is_adm:
-            if cmd in ("!stop", "!remove", "!addadmin", "!removeadmin", "!admins",
-                       "!aplist", "!apadd", "!apremove", "!apclear"):
-                await self._chat("❌ هذا الأمر للأدمن فقط.")
-            return
-
-        if cmd == "!stop":
-            QUEUE.clear(); STATE.set(None)
-            self._playing = False
-            BROADCAST.skip()
-            await self._chat("⏹️ تم الإيقاف وحذف القائمة.")
-            return
-
-        if cmd == "!remove":
-            if not arg.isdigit():
-                await self._chat("❌ !remove رقم"); return
-            r = QUEUE.remove(int(arg) - 1)
-            await self._chat(f"🗑️ حُذف: {r.query}" if r else "❌ رقم غير صحيح.")
-            return
-
-        if cmd == "!addadmin":
-            if not arg:
-                await self._chat("❌ !addadmin اسم"); return
-            STATE.add_admin(arg)
-            await self._chat(f"✅ @{arg} أصبح أدمن.")
-            return
-
-        if cmd == "!removeadmin":
-            if not arg:
-                await self._chat("❌ !removeadmin اسم"); return
-            STATE.del_admin(arg)
-            await self._chat(f"✅ تم إزالة @{arg}.")
-            return
-
-        if cmd == "!admins":
-            a = STATE.admins
-            await self._chat(
-                "👥 الأدمنز:\n" + "\n".join(f"  • @{x}" for x in a)
-                if a else "👥 لا يوجد أدمنز.")
-            return
-
-        if cmd == "!aplist":
-            songs = AUTOPLAY.snap()
-            idx   = AUTOPLAY._idx
-            if not songs:
-                await self._chat("📋 قائمة التلقائي فارغة.\n!apadd اسم — لإضافة أغنية")
+        """عند استقبال رسالة في الشات"""
+        try:
+            msg_lower = message.lower().strip()
+            
+            # ✅ تجاهل رسائل البوت نفسه لمنع التكرار أو تنفيذ أوامر على نفسه
+            if user.id == self.highrise.my_id:
                 return
-            header = f"🔁 التلقائي ({len(songs)} أغنية):"
-            lines  = []
-            for i, s in enumerate(songs):
-                marker = "▶️" if i == idx % len(songs) else f"{i+1}."
-                lines.append(f"  {marker} {s[:38]}")
-            full = header + "\n" + "\n".join(lines)
-            if len(full) <= 240:
-                await self._chat(full)
-            else:
-                await self._chat(header)
-                chunk = ""
-                for line in lines:
-                    test = (chunk + "\n" + line).strip() if chunk else line
-                    if len(test) > 230:
-                        await self._chat(chunk)
-                        await asyncio.sleep(0.3)
-                        chunk = line
-                    else:
-                        chunk = test
-                if chunk:
-                    await self._chat(chunk)
-            return
 
-        if cmd == "!apadd":
-            if not arg:
-                await self._chat("❌ !apadd اسم الأغنية"); return
-            msg = AUTOPLAY.add(arg)
-            await self._chat(f"🔁 {msg}\n📝 {arg[:50]}")
-            return
+            # التحقق من المستخدم المكتوم
+            if user.id in self.muted_users:
+                await self.highrise.send_whisper(user.id, "🔇 أنت مكتوم! لا يمكنك الكتابة في الشات")
+                return
+            
+            # رقم 0 = إيقاف الرقص (أعلى أولوية!)
+            if message.strip() == "0":
+                await self.stop_dance(user)
+                return
+            
+            parts = message.strip().split()
+            if not parts:
+                return
+            
 
-        if cmd == "!apremove":
-            if not arg.isdigit():
-                await self._chat("❌ !apremove رقم"); return
-            removed = AUTOPLAY.remove(int(arg) - 1)
-            await self._chat(
-                f"🗑️ حُذفت: {removed[:60]}"
-                if removed else "❌ رقم غير صحيح.")
-            return
+            
+            # 💫 نظام التفاعل المزدوج (Interaction System) - أولوية قصوى
+            # الصيغة: <اسم_تفاعل> <يوزر> [لوب]
+            if len(parts) >= 2:
+                cmd = parts[0].lower()
+                target_name = parts[1]
+                is_loop = False
+                
+                # التحقق من وجود كلمة لوب
+                if len(parts) >= 3 and parts[2].lower() in ["لوب", "loop", "تكرار"]:
+                    is_loop = True
 
-        if cmd == "!apclear":
-            AUTOPLAY.clear()
-            await self._chat("🗑️ تم مسح قائمة التشغيل التلقائي.")
-            return
-
-    async def _run_queue(self):
-        if self._playing: return
-        self._playing = True
-        try:
-            while not QUEUE.empty() and self._connected:
-                req = QUEUE.pop()
-                if not req: break
-                if not self._connected: break
-
-                try:
-                    info = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            _EXEC, fetch_song, req.query),
-                        timeout=float(FETCH_TIMEOUT + 10))
-                except asyncio.TimeoutError:
-                    info = None
-
-                if not self._connected: break
-
-                if not info:
-                    await self._chat(f"❌ لم أجد: {req.query}")
-                    continue
-
-                song = Song(
-                    query=req.query, title=info.title,
-                    url=info.url, duration=info.duration,
-                    by=req.by)
-                STATE.set(song)
-                _done_ev.clear()
-
-                q_txt = f"\n📋 في القائمة: {QUEUE.size()}" if QUEUE.size() else ""
-                await self._chat(
-                    f"▶️ {song.title}\n"
-                    f"⏱️ {song.dur_str} | 👤 @{song.by}"
-                    f"{q_txt}")
-
-                BROADCAST.play(song)
-
-                max_wait = (song.duration if song.duration > 0 else 7200) + 180
-                waited   = 0
-                while not _done_ev.is_set() and self._connected:
-                    await asyncio.sleep(1)
-                    STATE.tick()
-                    waited += 1
-                    if waited > max_wait:
-                        log.warning("⚠️ timeout إجباري")
-                        BROADCAST.skip()
+                # البحث في التفاعلات
+                interaction_found = None
+                for key, data in self.interactions.items():
+                    if cmd in data["en"] or cmd in data["ar"]:
+                        interaction_found = data
                         break
+                
+                if interaction_found:
+                    await self.perform_interaction(user, target_name, interaction_found, is_loop)
+                    return
 
-                # إذا انتهت الأغنية بسرعة → أعد المحاولة مرة
-                elapsed = STATE.elapsed_s()
-                if elapsed < 5 and not _skip_ev.is_set():
-                    log.warning("⚠️ أغنية قصيرة (%ds) — إعادة جلب: %s", elapsed, req.query)
-                    await asyncio.sleep(2)
-                    try:
-                        import yt_dlp as ytdl
-                        opts = {
-                            "quiet": True, "no_warnings": True, "noplaylist": True,
-                            "format": "bestaudio[ext=m4a]/bestaudio/best",
-                            "skip_download": True, "socket_timeout": 20, "retries": 3,
-                            "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
-                        }
-                        with ytdl.YoutubeDL(opts) as ydl:
-                            info2 = ydl.extract_info(f"ytsearch1:{req.query}", download=False)
-                            if info2 and info2.get("entries") and info2["entries"][0]:
-                                e2   = info2["entries"][0]
-                                url2 = e2.get("url", "")
-                                if url2:
-                                    song2 = Song(
-                                        query=req.query,
-                                        title=str(e2.get("title", req.query))[:100],
-                                        url=url2, duration=int(e2.get("duration") or 0),
-                                        by=req.by)
-                                    STATE.set(song2); _done_ev.clear()
-                                    BROADCAST.play(song2)
-                                    max_w2 = (song2.duration if song2.duration > 0 else 7200) + 180
-                                    w2 = 0
-                                    while not _done_ev.is_set() and self._connected:
-                                        await asyncio.sleep(1)
-                                        STATE.tick(); w2 += 1
-                                        if w2 > max_w2: BROADCAST.skip(); break
-                                    STATE.add_history(song2); STATE.set(None)
-                                    await asyncio.sleep(0.2); continue
-                    except Exception as retry_err:
-                        log.error("إعادة فشلت: %s", retry_err)
+            # 💫 نظام الرقص الثنائي القديم (رقصات عادية) - أولوية ثانية
+            # الصيغة: <اسم_تفاعل> <يوزر>
+            # شرط إضافي: الكلمة الثانية ليست "لوب" (لان ذلك يعني رقص فردي متكرر)
+            if len(parts) >= 2 and parts[1].lower() not in ["loop", "لوب", "تكرار"]:
+                # 💃 أولاً: فحص إذا كان رقم رقصة
+                try:
+                    dance_num = int(parts[0])
+                    if 1 <= dance_num < len(self.emote_list):
+                        # رقص ثنائي بالرقم (مع لوب)
+                        await self.dance_with_user(user, parts[1], dance_num)
+                        return
+                except ValueError:
+                    pass
+                
+                # ثانياً: فحص إذا كان اسم رقصة (إنجليزي أو عربي)
+                first_word = parts[0].lower()
+                
+                for emote_key, emote in self.emotes.items():
+                    # فحص الاسم الإنجليزي (مفتاح القاموس)
+                    if emote_key.lower() == first_word:
+                        await self.dance_with_user(user, parts[1], emote_key)
+                        return
+                    # فحص الأسماء العربية
+                    for ar_name in emote.get("ar", []):
+                        if ar_name.lower() == first_word:
+                            await self.dance_with_user(user, parts[1], emote_key)
+                            return
+                
 
-                STATE.add_history(song); STATE.set(None)
-                await asyncio.sleep(0.2)
+            
+            # نظام الرياكشنات - أولوية عالية
+            if len(parts) == 2:
+                possible_reaction1 = parts[0].lower()
+                target_username1 = parts[1]
+                target_username2 = parts[0]
+                possible_reaction2 = parts[1].lower()
+                
+                reaction_found = None
+                target_username = None
+                
+                for reaction_key, reaction_data in self.reactions.items():
+                    if possible_reaction1 in reaction_data["ar"]:
+                        reaction_found = reaction_key
+                        target_username = target_username1
+                        break
+                
+                if not reaction_found:
+                    for reaction_key, reaction_data in self.reactions.items():
+                        if possible_reaction2 in reaction_data["ar"]:
+                            reaction_found = reaction_key
+                            target_username = target_username2
+                            break
+                
+                if reaction_found and target_username:
+                    await self.send_reactions(user, target_username, reaction_found)
+                    return
+            
+            # نظام الرقصات
+            # الأرقام = لوب دائماً
+            # الأسماء = مرة واحدة (إلا إذا كتب "لوب")
+            if len(parts) == 1:
+                try:
+                    dance_num = int(parts[0])
+                    if 1 <= dance_num < len(self.emote_list):
+                        await self.user_dance(user, dance_num, enable_loop=True)  # الأرقام دائماً مع لوب
+                        return
+                except (ValueError, IndexError):
+                    pass
+            
+            # التحقق إذا الرسالة اسم رقصة (مرة واحدة فقط)
+            if len(parts) == 1:
+                for emote_key, emote in self.emotes.items():
+                    # فحص الاسم الإنجليزي
+                    if emote_key.lower() == msg_lower:
+                        await self.user_dance(user, emote_key, enable_loop=False)
+                        return
+                    # فحص الأسماء العربية
+                    for ar_name in emote.get("ar", []):
+                        if ar_name.lower() == msg_lower:
+                            await self.user_dance(user, emote_key, enable_loop=False)
+                            return
+            
+            # التحقق إذا الرسالة اسم رقصة + "لوب"
+            elif len(parts) == 2 and parts[1].lower() in ["لوب", "loop"]:
+                loop_word = parts[0].lower()
+                for emote_key, emote in self.emotes.items():
+                    # فحص الاسم الإنجليزي
+                    if emote_key.lower() == loop_word:
+                        await self.user_dance(user, emote_key, enable_loop=True)
+                        return
+                    # فحص الأسماء العربية
+                    for ar_name in emote.get("ar", []):
+                        if ar_name.lower() == loop_word:
+                            await self.user_dance(user, emote_key, enable_loop=True)
+                            return
+            
+            # فحص الكلمات المحظورة
+            if self.auto_mod:
+                for word in self.banned_words:
+                    if word.lower() in msg_lower:
+                        await self.warn_user(user, "استخدام كلمات محظورة")
+                        return
+            
+            # الحماية من السبام
+            if self.spam_protection:
+                if await self.check_spam(user):
+                    await self.warn_user(user, "السبام")
+                    return
+            
+            # معالجة الأوامر
+            await self.handle_command(user, message)
+            
+        except Exception as e:
+            print(f"Error in on_chat: {e}")
+            import traceback
+            traceback.print_exc()
 
-            if self._connected:
-                await self._chat("📭 انتهت القائمة.")
+    async def user_dance(self, user: User, dance_num, enable_loop: bool = False):
+        """جعل المستخدم يرقص - مع نظام منع التداخل والتحقق من الرقصة"""
+        try:
+            # 1. منع ترقيص البوت من الآخرين
+            if user.id == self.highrise.my_id:
+                pass 
 
-            if QUEUE.empty() and self._connected:
-                nxt = AUTOPLAY.next_song()
-                if nxt: QUEUE.add(nxt, "🤖 تلقائي")
+            # 2. نظام تتبع الطلبات لمنع التداخل عند السرعة
+            import time
+            request_id = time.time()
+            self.active_dance_requests[user.id] = request_id
 
+            # 3. إيقاف أي مهمة رقص سابقة
+            if user.id in self.dancing_users:
+                self.dancing_users[user.id].cancel()
+                try:
+                    del self.dancing_users[user.id]
+                except: pass
+
+            # 4. تحديد الرقصة (رقم أو اسم)
+            emote = None
+            if isinstance(dance_num, int):
+                if 1 <= dance_num < len(self.emote_list):
+                    emote = self.emote_list[dance_num]
+            elif isinstance(dance_num, str):
+                emote = self.emotes.get(dance_num)
+            
+            if not emote:
+                 await self.highrise.send_whisper(user.id, f"❌ لم أجد هذه الرقصة: {dance_num}")
+                 return
+
+            # 5. تجهيز نص الرسالة
+            dance_name_str = ""
+            dance_number_str = ""
+            
+            # البحث عن الاسم العربي للرقصة
+            for k, v in self.emotes.items():
+                if v["id"] == emote["id"]:
+                    dance_name_str = k
+                    break
+            
+            if not dance_name_str:
+                dance_name_str = dance_num if isinstance(dance_num, str) else "رقصة"
+
+            # إيجاد رقم الرقصة من القائمة
+            try:
+                idx = self.emote_list.index(emote)
+                dance_number_str = str(idx)
+            except:
+                dance_number_str = str(dance_num) if isinstance(dance_num, int) else "?"
+            
+            if enable_loop:
+                msg = f"💃 رقصة: {dance_name_str} (رقم {dance_number_str}) - مستمر"
+            else:
+                msg = f"💃 رقصة رقم: {dance_number_str}"
+
+            # 6. إرسال الرقصة (مع دعم البديل المجاني)
+            await self.safe_send_emote(emote["id"], user.id)
+            
+            # 7. التأكد أن الطلب لا يزال صالحاً (لم يتم استبداله بطلب أسرع)
+            if self.active_dance_requests.get(user.id) != request_id:
+                return
+
+            await self.highrise.send_whisper(user.id, msg)
+
+            # 8. تشغيل اللوب إذا طلب المستخدم
+            if enable_loop:
+                task = asyncio.create_task(self.loop_dance(user.id, emote))
+                self.dancing_users[user.id] = task
+            
+        except Exception as e:
+            print(f"Error in user_dance: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                await self.highrise.send_whisper(user.id, "❌ حدث خطأ بسيط في تشغيل الرقصة")
+            except: pass
+    
+    async def dance_with_user(self, requester: User, target_username: str, dance_num):
+        """
+        الرقص الثنائي - أنت + يوزر ترقصوا نفس الرقصة مع لوب
+        الصيغة: <رقم> <يوزر> أو <اسم_رقصة> <يوزر>
+        """
+        try:
+            # ✅ منع ترقيص البوت
+            target_user = await self.get_user_by_name(target_username)
+            
+            if not target_user:
+                await self.highrise.send_whisper(requester.id, f"❌ لم يتم العثور على: {target_username}")
+                return
+            
+            # ✅ منع ترقيص البوت
+            bot_user_id = self.highrise.my_id
+            if target_user.id == bot_user_id:
+                await self.highrise.send_whisper(requester.id, "❌ ممنوع ترقيص البوت!")
+                return
+            
+            # التأكد من وجود الرقصة
+            emote = None
+            
+            # ✅ دعم الأرقام (عبر القائمة) والأسماء (عبر القاموس)
+            if isinstance(dance_num, int):
+                if 1 <= dance_num < len(self.emote_list):
+                    emote = self.emote_list[dance_num]
+            elif isinstance(dance_num, str):
+                emote = self.emotes.get(dance_num)
+                
+            if not emote:
+                await self.highrise.send_whisper(requester.id, f"❌ رقصة غير صحيحة!")
+                return
+            
+            # ✨ حماية الملاك والمشرفين والمتميزين من الرقصات غير المرغوب فيها
+            is_owner = target_user.username.lower() in [o.lower() for o in self.owners]
+            is_target_admin = await self.is_admin(target_user)
+            is_requester_admin = await self.is_admin(requester)
+            is_distinguished = target_user.username.lower() in [u.lower() for u in self.distinguished_users]
+            
+            if is_owner and requester.id != target_user.id:
+                await self.highrise.send_whisper(requester.id, "🛡️ لا يمكنك إجبار المالك على الرقص! الملوك يرقصون متى شاؤوا. 👑")
+                return
+            
+            if is_target_admin and not is_requester_admin:
+                await self.highrise.send_whisper(requester.id, "🛡️ لا يمكنك إجبار المشرف على الرقص! المشرفون يرقصون متى شاؤوا. 🛡️")
+                return
+
+            if is_distinguished:
+                # التحقق إذا كان الشخص الذي يطلب الرقص ليس مشرفاً أو الطرف المتميز نفسه
+                if not await self.is_admin(requester) and requester.id != target_user.id:
+                    await self.highrise.send_whisper(requester.id, f"🛡️ @{target_user.username} شخص مميز، لا يمكنك إجباره على الرقص!")
+                    return
+            
+            # إيقاف أي رقص سابق للطرفين
+            if requester.id in self.dancing_users:
+                self.dancing_users[requester.id].cancel()
+                del self.dancing_users[requester.id]
+            
+            if target_user.id in self.dancing_users:
+                self.dancing_users[target_user.id].cancel()
+                del self.dancing_users[target_user.id]
+            
+            # إرسال نفس الرقصة للاثنين
+            await asyncio.gather(
+                self.highrise.send_emote(emote["id"], requester.id),
+                self.highrise.send_emote(emote["id"], target_user.id)
+            )
+            
+            # إنشاء لوب للاثنين
+            task1 = asyncio.create_task(self.loop_dance(requester.id, emote))
+            task2 = asyncio.create_task(self.loop_dance(target_user.id, emote))
+            
+            self.dancing_users[requester.id] = task1
+            self.dancing_users[target_user.id] = task2
+            
+        except Exception as e:
+            print(f"Error in dance_with_user: {e}")
+
+
+    async def group_dance(self, admin: User, target_username: str, dance_num):
+        """رقص جماعي - المشرف + اللاعب يرقصوا نفس الرقصة"""
+        try:
+            target_user = await self.get_user_by_name(target_username)
+            if not target_user:
+                await self.highrise.chat(f"❌ لم يتم العثور على: {target_username}")
+                return
+            
+            emote = None
+            
+            # ✅ دعم الأرقام (عبر القائمة) والأسماء (عبر القاموس)
+            if isinstance(dance_num, int):
+                if 1 <= dance_num < len(self.emote_list):
+                    emote = self.emote_list[dance_num]
+            elif isinstance(dance_num, str):
+                emote = self.emotes.get(dance_num)
+            
+            if not emote:
+                await self.highrise.chat(f"❌ رقصة غير صحيحة!")
+                return
+            
+            if admin.id in self.dancing_users:
+                self.dancing_users[admin.id].cancel()
+                del self.dancing_users[admin.id]
+            
+            if target_user.id in self.dancing_users:
+                self.dancing_users[target_user.id].cancel()
+                del self.dancing_users[target_user.id]
+            
+            await asyncio.gather(
+                self.highrise.send_emote(emote["id"], admin.id),
+                self.highrise.send_emote(emote["id"], target_user.id)
+            )
+            
+            await self.highrise.chat(f"💃🕺 {admin.username} و {target_user.username} يرقصون رقصة {dance_num} معاً!")
+            
+            task1 = asyncio.create_task(self.loop_dance(admin.id, emote))
+            task2 = asyncio.create_task(self.loop_dance(target_user.id, emote))
+            self.dancing_users[admin.id] = task1
+            self.dancing_users[target_user.id] = task2
+            
+        except Exception as e:
+            print(f"Error in group_dance: {e}")
+            await self.highrise.chat(f"❌ خطأ في الرقص الجماعي")
+    
+    async def stop_dance(self, user: User):
+        """إيقاف رقص المستخدم وأي تفاعلات ثنائية"""
+        try:
+            # إلغاء الطلبات المعلقة
+            if user.id in self.active_dance_requests:
+                del self.active_dance_requests[user.id]
+                
+            if user.id in self.dancing_users:
+                self.dancing_users[user.id].cancel()
+                del self.dancing_users[user.id]
+                print(f"Stopped dance task for {user.username}")
+            
+
+            
+            try:
+                await self.highrise.send_emote("idle-loop-happy", user.id)
+                await asyncio.sleep(0.1)
+                await self.highrise.send_emote("emote-no", user.id)
+            except:
+                await self.highrise.send_emote("emote-tired", user.id)
+            
+            await self.highrise.send_whisper(user.id, f"🛑 توقفت عن الرقص")
+            
+        except Exception as e:
+            print(f"Error stopping dance: {e}")
+    
+    async def loop_dance(self, user_id: str, emote: dict):
+        """تكرار الرقصة للأبد"""
+        try:
+            while True:
+                if not self.connection_active:
+                    break
+                delay = max(emote["dur"], 3.0)
+                await asyncio.sleep(delay)
+                await self.safe_send_emote(emote["id"], user_id)
         except asyncio.CancelledError:
-            log.info("_run_queue: إلغاء")
+            print(f"Stopped dance loop for {user_id}")
         except Exception as e:
-            log.exception("_run_queue خطأ: %s", e)
-        finally:
-            self._playing = False
-
-    async def _watchdog_loop(self):
+            print(f"Error in loop_dance: {e}")
+    
+    async def bot_auto_dance(self):
+        """البوت يرقص تلقائياً - يتبدل بين جميع الرقصات المطلوبة"""
+        dance_keys = ["floss", "swag", "ViralGroove", "PopularVibe", "Twerk", "Griddy", "TrueHeart"]
+        current_idx = 0
+        
+        while self.bot_dancing and self.connection_active:
+            try:
+                if not self.connection_active:
+                    break
+                    
+                key = dance_keys[current_idx]
+                emote = self.emotes.get(key)
+                if not emote:
+                    # Fallback if key not found (shouldn't happen)
+                    current_idx = (current_idx + 1) % len(dance_keys)
+                    continue
+                
+                await self.highrise.send_emote(emote["id"])
+                
+                # وقت الرقصة + قليل من التأخير
+                delay = max(emote["dur"] + 0.5, 5.0)
+                await asyncio.sleep(delay)
+                
+                # الانتقال للرقصة التالية
+                current_idx = (current_idx + 1) % len(dance_keys)
+                
+            except asyncio.CancelledError:
+                print("Bot auto-dance stopped")
+                break
+            except Exception as e:
+                error_msg = str(e)
+                if "transport" in error_msg.lower() or "closing" in error_msg.lower():
+                    print("Connection lost detected. Stopping dance task.")
+                    self.connection_active = False
+                    break
+                if "User not in room" not in error_msg:
+                    print(f"Error in bot auto-dance: {e}")
+                await asyncio.sleep(5)
+    
+    async def safe_send_emote(self, emote_id, user_id, fallback_id="emote-tired"):
+        """محاولة إرسال رقصة، وإذا فشلت (لعدم الملكية) نرسل رقصة بديلة مجانية"""
         try:
-            while self._connected:
-                await asyncio.sleep(60)
-                if not self._connected: break
-                if (not self._playing
-                        and not QUEUE.empty()
-                        and (self._task is None or self._task.done())):
-                    log.warning("🔧 Watchdog: أعاد تشغيل _run_queue")
-                    self._task = asyncio.create_task(self._run_queue())
-        except asyncio.CancelledError: pass
+            await self.highrise.send_emote(emote_id, user_id)
         except Exception as e:
-            log.error("watchdog خطأ: %s", e)
+            # إذا فشل بسبب عدم الملكية، نرسل البديل
+            if "owned" in str(e) or "free" in str(e):
+                try:
+                    await self.highrise.send_emote(fallback_id, user_id)
+                except:
+                    pass
+            else:
+                print(f"Error sending emote {emote_id}: {e}")
 
-    async def _chat(self, msg: str):
-        if not self._connected: return
-        if len(msg) > 240: msg = msg[:237] + "..."
+    async def perform_interaction(self, user: User, target_username: str, interaction: dict, is_loop: bool = False):
+        """تنفيذ تفاعل بين مستخدمين (فاعل ومفعول به)"""
         try:
-            await self.highrise.chat(msg)
+            target_user = await self.get_user_by_name(target_username)
+            if not target_user:
+                await self.highrise.send_whisper(user.id, f"❌ لم يتم العثور على: {target_username}")
+                return
+            
+            # منع التفاعل مع البوت (بشكل عام)
+            if target_user.id == self.highrise.my_id:
+                await self.highrise.send_whisper(user.id, "❌ لا يمكنك فعل ذلك مع البوت!")
+                return
+            
+            # ✨ حماية الملاك والمشرفين والمتميزين من التفاعلات
+            is_owner = target_user.username.lower() in [o.lower() for o in self.owners]
+            is_target_admin = await self.is_admin(target_user)
+            is_requester_admin = await self.is_admin(user)
+            is_distinguished = target_user.username.lower() in [u.lower() for u in self.distinguished_users]
+            
+            # تحديد التفاعلات "غير الجميلة"
+            bad_interactions = ["slap", "punch", "kick", "stab", "shoot", "bite", "scare", "laugh"]
+            
+            if is_owner and user.id != target_user.id:
+                await self.highrise.send_whisper(user.id, "🛡️ لا يمكنك استخدام التفاعلات مع الملاك! لديهم حصانة كاملة. 👑")
+                return
+            
+            if is_target_admin and not is_requester_admin:
+                await self.highrise.send_whisper(user.id, "🛡️ لا يمكنك استخدام التفاعلات مع المشرفين! لديهم حصانة ضد اللاعبين العاديين. 🛡️")
+                return
+
+            if is_distinguished:
+                # التحقق إذا كان التفاعل في القائمة السوداء
+                interaction_key = next((k for k, v in self.interactions.items() if v == interaction), "unknown")
+                if interaction_key in bad_interactions:
+                    await self.highrise.send_whisper(user.id, f"🛡️ هذا الشخص مميز! لا يمكنك استخدام رقصات مخلة أو تفاعلات مزعجة معه.")
+                    return
+            
+            # إيقاف أي رقص سابق للطرفين إذا كان لوب
+            if is_loop:
+                if user.id in self.dancing_users:
+                    self.dancing_users[user.id].cancel()
+                if target_user.id in self.dancing_users:
+                    self.dancing_users[target_user.id].cancel()
+                
+                await self.highrise.chat(f"🔥 {user.username} بدأ سلسلة {interaction['ar'][0]} على {target_user.username}!")
+                
+                task = asyncio.create_task(self.loop_interaction(user.id, target_user.id, interaction))
+                self.dancing_users[user.id] = task
+                
+            else:
+                # محاولة تنفيذ التفاعل مرة واحدة مع استخدام البديل الآمن
+                await asyncio.gather(
+                    self.safe_send_emote(interaction["id"], user.id, "emoji-angry"),
+                    self.safe_send_emote(interaction["target_id"], target_user.id, "emote-tired")
+                )
+                await self.highrise.chat(f"🔥 {user.username} قام بـ {interaction['ar'][0]} {target_user.username}!")
+            
         except Exception as e:
-            log.warning("chat فشل: %s", e)
+            print(f"Error in perform_interaction: {e}")
 
-    async def _cancel_task(self):
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try: await self._task
-            except Exception: pass
-        self._task = None
-
-# ════════════════════════════════════════════════════
-#  حالة عالمية
-# ════════════════════════════════════════════════════
-_play_lock     = asyncio.Lock()
-_rate:          dict[str, float] = {}
-_skip_cooldown: list[float]      = [0.0]
-
-# ════════════════════════════════════════════════════
-#  ✅ حلقة رئيسية تجمع HTTP + Bot معاً في asyncio
-# ════════════════════════════════════════════════════
-async def _main():
-    global _play_lock, _rate, _skip_cooldown
-
-    # ① ابدأ HTTP Server أولاً (Render يتحقق من /health)
-    await _start_http_server()
-
-    backoff = 5
-    while True:
+    async def loop_interaction(self, user_id: str, target_id: str, interaction: dict):
+        """لوب التفاعل"""
         try:
-            log.info("🔌 جاري الاتصال بـ Highrise...")
-            _play_lock     = asyncio.Lock()
-            _rate          = {}
-            _skip_cooldown = [0.0]
-            await main([BotDefinition(RadioBot(), ROOM_ID, TOKEN)])
-            backoff = 5
+            while True:
+                if not self.connection_active:
+                    break
+                await asyncio.gather(
+                    self.safe_send_emote(interaction["id"], user_id, "emoji-angry"),
+                    self.safe_send_emote(interaction["target_id"], target_id, "emote-tired")
+                )
+                delay = max(interaction["dur"] + 0.5, 3.0)
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
-            if _bot_ref: _bot_ref._connected = False
-            log.error("❌ %s — إعادة خلال %ds", e, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            print(f"Error in loop_interaction: {e}")
 
-# ════════════════════════════════════════════════════
-#  نقطة الدخول
-# ════════════════════════════════════════════════════
+    async def send_reactions(self, user: User, target_username: str, reaction_type: str):
+        """Bot sends real reactions to target user"""
+        print(f"send_reactions: {user.username} -> {target_username} ({reaction_type})")
+        
+        target_user = await self.get_user_by_name(target_username)
+        if not target_user:
+            await self.highrise.chat(f"❌ لم يتم العثور على المستخدم: {target_username}")
+            return
+        
+        # ✅ منع إرسال رياكشنات للبوت والملاك والمشرفين
+        bot_user_id = self.highrise.my_id
+        is_owner = target_user.username.lower() in [o.lower() for o in self.owners]
+        is_target_admin = await self.is_admin(target_user)
+        is_requester_admin = await self.is_admin(user)
+        
+        if target_user.id == bot_user_id:
+            await self.highrise.send_whisper(user.id, "❌ ممنوع إرسال رياكشنات للبوت!")
+            return
+        
+        if is_owner and user.id != target_user.id:
+            await self.highrise.send_whisper(user.id, "🛡️ الملاك لديهم حصانة ضد الرياكشنات المزعجة! 👑")
+            return
+            
+        if is_target_admin and not is_requester_admin:
+            await self.highrise.send_whisper(user.id, "🛡️ لا يمكنك إرسال رياكشنات مزعجة للمشرفين! 🛡️")
+            return
+        
+        reaction_map = {
+            "heart": {"reaction": "heart", "ar": ["قلب", "ق", "حب", "ح", "h"]},
+            "thumbs": {"reaction": "thumbs", "ar": ["اعجاب", "ا", "لايك", "ثامز", "thumbs"]},
+            "clap": {"reaction": "clap", "ar": ["تصفيق", "ت", "كلاب", "clap"]},
+            "wave": {"reaction": "wave", "ar": ["تلويح", "تل", "باي", "wave"]},
+            "wink": {"reaction": "wink", "ar": ["غمزة", "غ", "وينك", "wink"]},
+        }
+        
+        reaction_name = None
+        reaction_value = None
+        
+        for key, data in reaction_map.items():
+            if reaction_type.lower() == key.lower() or reaction_type.lower() in data["ar"]:
+                reaction_name = key
+                reaction_value = data["reaction"]
+                break
+        
+        if not reaction_value:
+            reactions_list = "، ".join([f"{k}: {'/'.join(v['ar'])}" for k, v in reaction_map.items()])
+            await self.highrise.chat(f"❌ رياكشن غير صحيح!\n💝 الرياكشنات المتاحة:\n{reactions_list}")
+            return
+        
+        try:
+            # ✅ إرسال 50 رياكشن دفعة واحدة
+            total_to_send = 50
+            
+            await self.highrise.chat(f"💝 جاري إرسال 50 {reaction_name} لـ {target_user.username}...")
+            
+            # إنشاء كل المهام دفعة واحدة
+            tasks = []
+            for _ in range(total_to_send):
+                tasks.append(asyncio.create_task(self.highrise.react(reaction_value, target_user.id)))
+            
+            # تنفيذها كلها في نفس الوقت
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            await self.highrise.chat(f"✅ تم إرسال 50 {reaction_name} بنجاح!")
+            
+        except Exception as e:
+            print(f"Error in reactions: {e}")
+
+    async def handle_command(self, user: User, message: str):
+        """معالجة أوامر البوت - مُصلحة بالكامل"""
+        if message.startswith("!"):
+            message = message[1:]
+        
+        parts = message.split()
+        if not parts:
+            return
+            
+        command = parts[0].lower()
+        is_admin_user = await self.is_admin(user)
+        
+        if command in ["help", "مساعدة", "مساعده", "هيلب", "الاوامر", "الأوامر", "اوامر"]:
+            help_message = "🌑 مجلس روم بلاك:\n✨ help: مساعدة\n🏢 floors: الطوابق\n💎 vip: للمشايخ\n🎮 game: ألعاب\n🕺 emotes: رقصات\n☕ إدارة: كتم/طرد/إعلان/مسح"
+            await self.safe_whisper(user.id, help_message)
+            return
+        
+        elif command in ["users", "مستخدمين", "يوزرز", "الاعبين", "اللاعبين", "ناس"]:
+            await self.list_users()
+            return
+        
+        elif command in ["time", "وقت", "الوقت", "تايم", "ساعة", "الساعة", "كم", "الساعه"]:
+            from datetime import datetime
+            current_time = datetime.now().strftime("%H:%M:%S")
+            await self.highrise.chat(f"⏰ الوقت الحالي: {current_time}")
+            return
+        
+        elif command in ["bot", "بوت", "روبوت"]:
+            await self.highrise.chat("🤖 أنا بوت إدارة الغرفة! استخدم: مساعدة")
+            return
+        
+        elif command in ["رقصات", "الرقصات", "emotes", "رقص"]:
+            emotes_help = """🕺 كيف ترقص؟
+1. اكتب رقم رقصة (1-239)
+2. اكتب: اسم_الرقصة (مثلاً: شافل)
+3. اكتب: اسم_الرقصة لوب (للتكرار)
+✨ رقصات مشهورة:
+شافل، داب، تويرك، قيتار، انمي، بطل، زومبي
+🛑 لإيقاف الرقص اكتب: 0"""
+            await self.safe_whisper(user.id, emotes_help)
+            return
+
+        elif command in ["game", "games", "ألعاب", "العاب", "لعبة", "لعبه"]:
+            games_msg = """🎮 الألعاب المتاحة قريباً:
+1️⃣ لعبة الأسئلة (قريباً)
+2️⃣ لعبة الجولد (قريباً)
+✨ حالياً يمكنك استخدام: رقصني (ليختار البوت لك رقصة عشوائية)"""
+            await self.safe_whisper(user.id, games_msg)
+            return
+
+        elif command in ["رقصني", "dance_me", "ارقص_لي"]:
+             # اختيار رقصة عشوائية مع لوب
+             try:
+                 random_dance = random.randint(1, len(self.emote_list) - 1)
+                 await self.user_dance(user, random_dance, enable_loop=True)
+             except:
+                 pass
+             return
+        
+
+        
+        # ═══════════════════════════════════════
+        # 🏢 أوامر التنقل (للجميع - بدون اسم يوزر)
+        # ═══════════════════════════════════════
+        
+        elif command in ["ارضي", "ground", "ارضيه", "الارضي", "تحت", "down"] and len(parts) == 1:
+            try:
+                await self.highrise.teleport(user.id, self.floors["ground"])
+                self.user_floors[user.id] = "ground"
+                await self.highrise.send_whisper(user.id, f"🏢 انتقلت للطابق الأرضي")
+            except Exception as e:
+                await self.highrise.send_whisper(user.id, f"❌ خطأ: {e}")
+            return
+        
+        elif (command in ["first", "up1", "الاول", "طابق_اول", "اول", "فوق"] and len(parts) == 1) or \
+             (command in ["فوق", "up"] and len(parts) == 2 and parts[1] == "1"):
+            try:
+                await self.highrise.teleport(user.id, self.floors["floor1"])
+                self.user_floors[user.id] = "floor1"
+                await self.highrise.send_whisper(user.id, f"🏬 انتقلت إلى (فوق)")
+            except Exception as e:
+                await self.highrise.send_whisper(user.id, f"❌ خطأ: {e}")
+            return
+
+        elif (command in ["second", "up2", "الثاني", "طابق_ثاني", "ثاني", "فوق2"] and len(parts) == 1) or \
+             (command in ["فوق2", "up"] and len(parts) == 2 and parts[1] == "2"):
+            try:
+                await self.highrise.teleport(user.id, self.floors["floor2"])
+                self.user_floors[user.id] = "floor2"
+                await self.highrise.send_whisper(user.id, f"🏬 انتقلت إلى (فوق2)")
+            except Exception as e:
+                await self.highrise.send_whisper(user.id, f"❌ خطأ: {e}")
+            return
+        
+        elif (command in ["vip", "شخصية_مهمة", "في_اي_بي"] and len(parts) == 1):
+            is_admin = await self.is_admin(user)
+            if not is_admin:
+                await self.highrise.send_whisper(user.id, "❌ طابق VIP مخصص للمشرفين فقط!")
+                return
+            try:
+                await self.highrise.teleport(user.id, self.floors["vip"])
+                self.user_floors[user.id] = "vip"
+                await self.highrise.send_whisper(user.id, f"💎 انتقلت إلى طابق VIP")
+            except Exception as e:
+                await self.highrise.send_whisper(user.id, f"❌ خطأ: {e}")
+            return
+        
+        elif command in ["طوابق", "floors", "الطوابق", "اين", "وين"]:
+            floors_info = """
+🏢 الطوابق المتاحة:
+
+🏢 الأرضي: ارضي / ground
+🏬 فوق: فوق / first
+🏬 فوق2: فوق2 / second
+💎 VIP: vip (للمشايخ فقط)
+
+✨ انقر على أي نقطة في طابق آخر
+   وسينقلك بالضبط للمكان! 🎯
+"""
+            await self.highrise.send_whisper(user.id, floors_info)
+            return
+        
+        if not is_admin_user:
+            # رسالة للمستخدمين العاديين إذا حاولوا استخدام أمر مشرف
+            admin_commands = ["طرد", "حظر", "كتم", "kick", "ban", "mute", "تحذير", "warn",
+                            "جلب", "tphere", "come", "جيب", "هات", "سحب", "br", "روح", "tpto", "رح", "تجميد", "freeze", "جمد", "قل", "say",
+                            "نقل_الكل", "r", "ر", "تحت", "down", "فوق", "up", "vip", "إعلان", "اعلان", "أعلن", "مسح", "تنظيف",
+                            "addmod", "اضف_مشرف", "removemod", "ازالة_مشرف", "ازل_مشرف", "invite", "دعوة", "tip", "جولد",
+                            "switch", "تبديل", "بدل", "move", "نقل_موقع", "equip", "ارتدي", "لبس",
+                            "addvip", "اضف_vip", "اضافة_vip", "removevip", "ازالة_vip", "adddist", "تميز", "تمييز"]
+            
+            if command in admin_commands:
+                await self.highrise.send_whisper(user.id, "❌ مسموح فقط للمشرفين (المشايخ) باستخدام هذا الأمر")
+            return
+        
+        # ═══════════════════════════════════════
+        # 👑 أوامر المشرفين (بعد التحقق)
+        # ═══════════════════════════════════════
+        
+        # 💃 الرقص الجماعي: <رقم> <يوزر>
+        if len(parts) == 2:
+            try:
+                dance_num = int(parts[0])
+                if 1 <= dance_num < len(self.emote_list):
+                    await self.group_dance(user, parts[1], dance_num)
+                    return
+            except ValueError:
+                first_word = parts[0].lower()
+                for emote_key, emote in self.emotes.items():
+                    if emote_key.lower() == first_word:
+                        await self.group_dance(user, parts[1], emote_key)
+                        return
+                    for ar_name in emote.get("ar", []):
+                        if ar_name.lower() == first_word:
+                            await self.group_dance(user, parts[1], emote_key)
+                            return
+        
+        if command in ["r", "ر", "قلوب", "قلوب_للكل"]:
+            try:
+                room_users = await self.highrise.get_room_users()
+                total_users = len(getattr(room_users, 'content', []))
+                
+                await self.highrise.chat(f"💝 البوت يرسل قلوب لكل اللاعبين ({total_users} لاعب)...")
+                
+                # إرسال على دفعات لتجنب فصل الاتصال
+                success_count = 0
+                for player, _ in getattr(room_users, 'content', []):
+                    try:
+                        await self.highrise.react("heart", player.id)
+                        success_count += 1
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+                
+                await self.highrise.chat(f"✅ تم إرسال {success_count} قلب لـ {total_users} لاعب! 💝💝")
+                
+            except Exception as e:
+                print(f"Error in bulk hearts: {e}")
+                await self.highrise.chat(f"❌ حدث خطأ")
+            return
+        
+        # أوامر نقل اللاعبين
+        elif command in ["تحت", "down"] and len(parts) >= 2:
+            target_user = await self.get_user_by_name(parts[1])
+            if target_user:
+                if target_user.id == self.highrise.my_id:
+                     await self.highrise.chat("❌ لا يمكنني نقل نفسي!")
+                     return
+                
+                # حماية الملاك والمشرفين
+                if self.is_owner(target_user) or await self.is_admin(target_user):
+                    if not self.is_owner(user):
+                        await self.highrise.send_whisper(user.id, "🛡️ لا يمكنك نقل الملاك أو المشرفين!")
+                        return
+
+                await self.highrise.teleport(target_user.id, self.floors["ground"])
+                self.user_floors[target_user.id] = "ground"
+                await self.highrise.chat(f"⬇️ تم نقل {parts[1]} تحت")
+            else:
+                await self.highrise.chat(f"❌ لم يتم العثور على: {parts[1]}")
+            return
+        
+        elif command in ["فوق", "up"] and len(parts) >= 2:
+            target_user = await self.get_user_by_name(parts[1])
+            if target_user:
+                if target_user.id == self.highrise.my_id:
+                     await self.highrise.chat("❌ لا يمكنني نقل نفسي!")
+                     return
+                
+                # حماية الملاك والمشرفين
+                if self.is_owner(target_user) or await self.is_admin(target_user):
+                    if not self.is_owner(user):
+                        await self.highrise.send_whisper(user.id, "🛡️ لا يمكنك نقل الملاك أو المشرفين!")
+                        return
+
+                await self.highrise.teleport(target_user.id, self.floors["floor1"])
+                self.user_floors[target_user.id] = "floor1"
+                await self.highrise.chat(f"⬆️ تم نقل {parts[1]} فوق")
+            else:
+                await self.highrise.chat(f"❌ لم يتم العثور على: {parts[1]}")
+            return
+        
+        elif command in ["vip", "في_اي_بي"] and len(parts) >= 2:
+            target_user = await self.get_user_by_name(parts[1])
+            if target_user:
+                if target_user.id == self.highrise.my_id:
+                     await self.highrise.chat("❌ لا يمكنني نقل نفسي!")
+                     return
+                
+                # حماية الملاك والمشرفين
+                if self.is_owner(target_user) or await self.is_admin(target_user):
+                    if not self.is_owner(user):
+                        await self.highrise.send_whisper(user.id, "🛡️ لا يمكنك نقل الملاك أو المشرفين!")
+                        return
+
+                await self.highrise.teleport(target_user.id, self.floors["vip"])
+                self.user_floors[target_user.id] = "vip"
+                await self.highrise.chat(f"💎 تم نقل {parts[1]} إلى طابق VIP")
+            else:
+                await self.highrise.chat(f"❌ لم يتم العثور على: {parts[1]}")
+            return
+        
+        # أوامر المالك
+        elif command in ["addmod", "addadmin", "اضف_مشرف", "اضف_ادمن"]:
+            if user.username.lower() not in [o.lower() for o in self.owners]:
+                await self.highrise.send_whisper(user.id, "❌ هذا الأمر للملاك فقط!")
+                return
+            if len(parts) >= 2:
+                new_admin = parts[1]
+                # إزالة علامة @ إذا كتبها المالك
+                if new_admin.startswith("@"):
+                    new_admin = new_admin[1:]
+                if new_admin.lower() not in [a.lower() for a in self.admins]:
+                    self.admins.append(new_admin)
+                    self.save_config()
+                    await self.highrise.chat(f"✅ تم إضافة @{new_admin} كمشرف")
+                else:
+                    await self.highrise.send_whisper(user.id, "❌ هذا المستخدم مشرف بالفعل")
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: اضف_مشرف أحمد")
+            return
+        
+        elif command in ["removemod", "removeadmin", "ازالة_مشرف", "ازل_مشرف", "ازالة_ادمن"]:
+            if user.username.lower() not in [o.lower() for o in self.owners]:
+                await self.highrise.send_whisper(user.id, "❌ هذا الأمر للملاك فقط!")
+                return
+            if len(parts) >= 2:
+                old_admin = parts[1].lower()
+                if old_admin.startswith("@"):
+                    old_admin = old_admin[1:]
+                original_admin = next((a for a in self.admins if a.lower() == old_admin), None)
+                if original_admin:
+                    self.admins.remove(original_admin)
+                    self.save_config()
+                    await self.highrise.chat(f"✅ تم إزالة إشراف @{parts[1].replace('@', '')}")
+                else:
+                    await self.highrise.send_whisper(user.id, "❌ هذا المستخدم ليس مشرفاً")
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: ازالة_مشرف أحمد")
+            return
+        # باقي أوامر المشرفين
+        elif command in ["طرد", "kick"]:
+            if not is_admin_user: return
+            if len(parts) >= 2:
+                # محاولة طرد اللاعب وحمايته إذا كان مالكاً
+                await self.kick_user(parts[1], user)
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: طرد أحمد")
+            return
+
+        elif command in ["إعلان", "اعلان", "أعلن", "announcement"]:
+            if not is_admin_user: return
+            if len(parts) > 1:
+                msg = " ".join(parts[1:])
+                await self.highrise.chat("📢 إعــــلان هــــام 📢")
+                await self.highrise.chat(f"✨ {msg} ✨")
+            else:
+                await self.safe_whisper(user.id, "❌ مثال: اعلان القهوة جاهزة يا شباب")
+            return
+
+        elif command in ["مسح", "clear", "تنظيف"]:
+            if not is_admin_user: return
+            # تنظيف الشات عبر إرسال رسائل فارغة كثيرة (أسلوب تقني)
+            await self.highrise.chat("🧹 جاري تنظيف المجلس...")
+            for _ in range(15):
+                await self.highrise.chat("ㅤ") # حرف مخفي
+            await self.highrise.chat("✅ تم تنظيف الشات بنجاح!")
+            return
+        
+        elif command in ["ban", "حظر", "احظر", "بان"]:
+            if len(parts) >= 2:
+                duration = int(parts[2]) if len(parts) >= 3 else 3600
+                await self.ban_user(parts[1], duration)
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: حظر أحمد")
+            return
+        
+        elif command in ["unban", "فك_حظر", "فك"]:
+            if len(parts) >= 2:
+                await self.unban_user(parts[1])
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: فك أحمد")
+            return
+        
+        elif command in ["mute", "كتم", "اكتم", "ميوت"]:
+            if len(parts) >= 2:
+                duration = int(parts[2]) if len(parts) >= 3 else 600
+                await self.mute_user(parts[1], duration)
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: كتم أحمد")
+            return
+        
+        elif command in ["unmute", "فك_كتم", "فك_الكتم"]:
+            if len(parts) >= 2:
+                await self.unmute_user(parts[1])
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: فك_كتم أحمد")
+            return
+        
+        elif command in ["warn", "تحذير", "حذر", "انذار"]:
+            if len(parts) >= 2:
+                reason = " ".join(parts[2:]) if len(parts) > 2 else "مخالفة قوانين الغرفة"
+                target = await self.get_user_by_name(parts[1])
+                if target:
+                    await self.warn_user(target, reason)
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: تحذير أحمد")
+            return
+        
+        elif command in ["tphere", "come", "جيب", "هات", "سحب", "br"]:
+            if len(parts) >= 2:
+                target_user = await self.get_user_by_name(parts[1])
+                if target_user:
+                    if target_user.id == user.id: return
+                    
+                    # حماية الملاك والمشرفين
+                    if self.is_owner(target_user) or await self.is_admin(target_user):
+                        if not self.is_owner(user):
+                            await self.highrise.send_whisper(user.id, "🛡️ لا يمكنك جلب الملاك أو المشرفين!")
+                            return
+
+                    room_users = await self.highrise.get_room_users()
+                    for u, pos in getattr(room_users, 'content', []):
+                        if u.id == user.id:
+                            await self.highrise.teleport(target_user.id, pos)
+                            self.user_floors[target_user.id] = self._get_floor_name(pos.y) or "ground"
+                            await self.highrise.chat(f"✅ تم جلب {parts[1]}")
+                            break
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: جلب أحمد")
+            return
+        
+        elif command in ["tpto", "روح", "رح", "روح_لـ"]:
+            if len(parts) >= 2:
+                target_user = await self.get_user_by_name(parts[1])
+                if target_user:
+                    room_users = await self.highrise.get_room_users()
+                    for u, pos in getattr(room_users, 'content', []):
+                        if u.id == target_user.id:
+                            await self.highrise.teleport(user.id, pos)
+                            await self.highrise.chat(f"✅ انتقل المشرف إلى {parts[1]}")
+                            break
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: روح أحمد")
+            return
+        
+        elif command in ["freeze", "تجميد", "جمد", "فريز", "تثبيت", "وقف", "ثبت"]:
+
+            if len(parts) >= 2:
+                await self.freeze_user(parts[1])
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: تجميد أحمد")
+            return
+        
+        elif command in ["unfreeze", "فك_تجميد", "فك_التجميد", "حرر", "فك"]:
+            if len(parts) >= 2:
+                await self.unfreeze_user(parts[1])
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: فك_تجميد أحمد")
+            return
+
+        # ═══════════════════════════════════════
+        # 💰 توزيع الجولد
+        # ═══════════════════════════════════════
+        elif command in ["tip", "جولد", "اعطي"]:
+            await self.tip_user(user, parts)
+            return
+
+        # ═══════════════════════════════════════
+        # 📨 الدعوات
+        # ═══════════════════════════════════════
+        elif command in ["invite", "دعوة", "دعوه"]:
+            custom_msg = " ".join(parts[1:]) if len(parts) > 1 else ""
+            await self.send_invites(user, custom_msg)
+            return
+
+        # ═══════════════════════════════════════
+        # 👗 نسخ ملابس مستخدم
+        # ═══════════════════════════════════════
+        elif command in ["equip", "ارتدي", "لبس"]:
+            if len(parts) >= 2:
+                await self.equip_bot_from_user(user, parts[1])
+            else:
+                await self.safe_whisper(user.id, "❌ مثال: equip اسم_البوت")
+            return
+
+        # ═══════════════════════════════════════
+        # 🔄 تبديل المواقع
+        # ═══════════════════════════════════════
+        elif command in ["switch", "تبديل", "بدل"]:
+            if len(parts) >= 2:
+                await self.switch_positions(user, parts[1])
+            else:
+                await self.safe_whisper(user.id, "❌ مثال: switch اسم")
+            return
+
+        elif command in ["move", "نقل_موقع"]:
+            if len(parts) >= 3:
+                await self.move_users(user, parts[1], parts[2])
+            else:
+                await self.safe_whisper(user.id, "❌ مثال: move اسم1 اسم2")
+            return
+
+        # ═══════════════════════════════════════
+        # ⭐ إدارة VIP
+        # ═══════════════════════════════════════
+        elif command in ["addvip", "اضف_vip", "اضافة_vip"]:
+            if len(parts) >= 2:
+                new_vip = parts[1].replace("@", "")
+                if new_vip.lower() not in [v.lower() for v in self.vip_users]:
+                    self.vip_users.append(new_vip)
+                    self.save_config()
+                    await self.safe_chat(f"⭐ تم إضافة @{new_vip} لقائمة VIP")
+                else:
+                    await self.safe_whisper(user.id, "❌ هذا المستخدم في قائمة VIP بالفعل")
+            else:
+                await self.safe_whisper(user.id, "❌ مثال: addvip اسم")
+            return
+
+        elif command in ["removevip", "ازالة_vip", "حذف_vip"]:
+            if len(parts) >= 2:
+                old_vip = parts[1].replace("@", "").lower()
+                original = next((v for v in self.vip_users if v.lower() == old_vip), None)
+                if original:
+                    self.vip_users.remove(original)
+                    self.save_config()
+                    await self.safe_chat(f"⭐ تم إزالة @{original} من قائمة VIP")
+                else:
+                    await self.safe_whisper(user.id, "❌ هذا المستخدم ليس في قائمة VIP")
+            else:
+                await self.safe_whisper(user.id, "❌ مثال: removevip اسم")
+            return
+
+        elif command == "vip" and len(parts) >= 2 and parts[1].lower() in ["list", "قائمة"]:
+            if self.vip_users:
+                vip_list = "\n".join([f"⭐ @{v}" for v in self.vip_users])
+                await self.safe_whisper(user.id, f"⭐ قائمة VIP:\n{vip_list}")
+            else:
+                await self.safe_whisper(user.id, "❌ قائمة VIP فارغة")
+            return
+
+        elif command in ["adddist", "تميز", "تمييز", "اضف_مميز"]:
+            if not is_admin_user: return
+            if len(parts) >= 2:
+                new_dist = parts[1].replace("@", "")
+                if new_dist.lower() not in [u.lower() for u in self.distinguished_users]:
+                    self.distinguished_users.append(new_dist)
+                    self.save_config()
+                    await self.safe_chat(f"✨ تم إضافة @{new_dist} لقائمة التميز (محمي من التفاعلات المزعجة) 🛡️")
+                else:
+                    await self.safe_whisper(user.id, "❌ هذا المستخدم مميز بالفعل")
+            else:
+                await self.safe_whisper(user.id, "❌ مثال: تميز أحمد")
+            return
+
+        elif command in ["removedist", "الغاء_تميز", "حذف_مميز"]:
+            if not is_admin_user: return
+            if len(parts) >= 2:
+                old_dist = parts[1].replace("@", "").lower()
+                original = next((u for u in self.distinguished_users if u.lower() == old_dist), None)
+                if original:
+                    self.distinguished_users.remove(original)
+                    self.save_config()
+                    await self.safe_chat(f"🛡️ تم إزالة @{original} من قائمة التميز")
+                else:
+                    await self.safe_whisper(user.id, "❌ هذا المستخدم ليس في قائمة التميز")
+            else:
+                await self.safe_whisper(user.id, "❌ مثال: الغاء_تميز أحمد")
+            return
+
+        elif command in ["distlist", "قائمة_التميز"]:
+            if self.distinguished_users:
+                dist_list = "\n".join([f"✨ @{u}" for u in self.distinguished_users])
+                await self.safe_whisper(user.id, f"📝 قائمة المستخدمين المميزين:\n{dist_list}")
+            else:
+                await self.safe_whisper(user.id, "❌ لا يوجد مميزين")
+            return
+        elif command == "admin" and len(parts) >= 2 and parts[1].lower() in ["list", "قائمة"]:
+            if self.admins:
+                valid_admins = [a for a in self.admins if a]
+                if valid_admins:
+                    admins_str = ", ".join([f"🛡️ @{a}" for a in valid_admins])
+                    await self.safe_whisper(user.id, f"🛡️ قائمة المشرفين:\n{admins_str}")
+                else:
+                    await self.highrise.chat("لا يوجد مشرفين حالياً")
+            return
+
+        elif command in ["نقل_الكل", "teleport_all"]:
+            if len(parts) >= 2:
+                floor_name = parts[1].lower()
+                
+                if floor_name in ["arضي", "ground", "0"]:
+                    target_floor = self.floors["ground"]
+                    floor_text = "الطابق الأرضي 🏢"
+                elif floor_name in ["اول", "first", "1"]:
+                    target_floor = self.floors["floor1"]
+                    floor_text = "الطابق الأول 🏬"
+                elif floor_name in ["ثاني", "second", "2"]:
+                    target_floor = self.floors["floor2"]
+                    floor_text = "الطابق الثاني 🏬"
+                elif floor_name in ["vip", "في_اي_بي", "v"]:
+                    target_floor = self.floors["vip"]
+                    floor_text = "طابق VIP 💎"
+                else:
+                    await self.highrise.send_whisper(user.id, "❌ طابق غير صحيح")
+                    return
+                
+                try:
+                    room_users = await self.highrise.get_room_users()
+                    count = 0
+                    for u, _ in getattr(room_users, 'content', []):
+                        if u.id != user.id:
+                            # حماية الملاك والمشرفين والمميزين من النقل الجماعي
+                            is_target_protected = self.is_owner(u) or u.username.lower() in [a.lower() for a in self.admins if a] or u.username.lower() in [d.lower() for d in self.distinguished_users]
+                            if is_target_protected: continue
+                            
+                            await self.highrise.teleport(u.id, target_floor)
+                            count += 1
+                    
+                    await self.highrise.chat(f"✅ تم نقل {count} مستخدم إلى {floor_text}")
+                except Exception as e:
+                    await self.highrise.chat(f"❌ خطأ: {e}")
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: نقل_الكل ارضي")
+            return
+        
+        elif command in ["ترحيب", "welcome"]:
+            if len(parts) >= 2:
+                self.welcome_message = " ".join(parts[1:])
+                self.save_config()
+                welcome_type = "عامة 📢" if self.welcome_public else "همس 💬"
+                await self.highrise.chat(f"✅ تم تحديث رسالة الترحيب ({welcome_type})")
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: ترحيب أهلا بك في المجلس")
+            return
+        
+        elif command in ["welcometype", "نوع_الترحيب"]:
+            self.welcome_public = not self.welcome_public
+            self.save_config()
+            welcome_type = "عامة 📢" if self.welcome_public else "همس 💬"
+            await self.highrise.chat(f"✅ الترحيب الآن عبر الـ: {welcome_type}")
+            return
+        
+        elif command in ["ترحيب_خاص", "customwelcome", "vip_welcome"]:
+            if len(parts) >= 3:
+                target_name = parts[1]
+                if target_name.startswith("@"):
+                    target_name = target_name[1:]
+                
+                custom_msg = " ".join(parts[2:])
+                self.custom_welcomes[target_name.lower()] = custom_msg
+                self.save_config()
+                
+                await self.highrise.chat(f"✅ تم تعيين ترحيب خاص لـ @{target_name}")
+                await self.highrise.send_whisper(user.id, f"📝 الرسالة: {custom_msg}")
+            elif len(parts) == 2 and parts[1].lower() in ["قائمة", "list"]:
+                if self.custom_welcomes:
+                    msg = "📋 الترحيبات الخاصة:\n"
+                    for name, wmsg in self.custom_welcomes.items():
+                        msg += f"• @{name}: {wmsg}\n"
+                    await self.highrise.send_whisper(user.id, msg)
+                else:
+                    await self.highrise.send_whisper(user.id, "❌ لا توجد ترحيبات خاصة")
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: ترحيب_خاص @الاسم رسالة الترحيب")
+            return
+        
+        elif command in ["حذف_ترحيب", "removewelcome"]:
+            if len(parts) >= 2:
+                target_name = parts[1].lower()
+                if target_name.startswith("@"):
+                    target_name = target_name[1:]
+                if target_name in self.custom_welcomes:
+                    del self.custom_welcomes[target_name]
+                    self.save_config()
+                    await self.highrise.chat(f"✅ تم حذف الترحيب الخاص لـ @{target_name}")
+                else:
+                    await self.highrise.send_whisper(user.id, f"❌ لا يوجد ترحيب خاص لـ @{target_name}")
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: حذف_ترحيب @الاسم")
+            return
+
+        elif command in ["wallet", "محفظة", "فلوس", "رصيد"]:
+            # التحقق من رصيد البوت
+            if not self.is_owner(user):
+                await self.highrise.send_whisper(user.id, "❌ هذا الأمر للملاك فقط!")
+                return
+            try:
+                res_wallet = await self.highrise.get_wallet()
+                if hasattr(res_wallet, 'content'):
+                    msg = "💰 رصيد البوت الحالي:"
+                    found_currencies = False
+                    for currency in res_wallet.content:
+                        # تحويل أسماء العملات للعربية للتسهيل
+                        c_type = currency.type
+                        if c_type == "gold": c_type = "ذهب"
+                        elif c_type == "bubbles": c_type = "فقاعات (Bubbles)"
+                        
+                        msg += f"\n- {c_type}: {currency.amount}"
+                        found_currencies = True
+                    
+                    if not found_currencies:
+                        msg += "\n(المحفظة فارغة 0)"
+                        
+                    await self.highrise.chat(msg)
+                else:
+                    await self.highrise.chat(f"❌ خطأ في جلب الرصيد: {res_wallet}")
+            except Exception as e:
+                await self.highrise.chat(f"❌ خطأ: {e}")
+            return
+        
+
+
+        # استعراض المشرفين (للجميع)
+        elif command in ["admins", "مشرفين", "المشرفين", "الادمنية"]:
+            if self.admins:
+                valid_admins = [a for a in self.admins if a]
+                if valid_admins:
+                    admins_str = ", ".join([f"@{a}" for a in valid_admins])
+                    await self.highrise.chat(f"🛡️ مشرفو المجلس: {admins_str}")
+                else:
+                    await self.highrise.chat("لا يوجد مشرفين حالياً")
+            else:
+                await self.highrise.chat("لا يوجد مشرفين حالياً")
+            return
+        
+        elif command in ["find", "بحث"]:
+            if len(parts) >= 2:
+                search_name = parts[1]
+                user_found = await self.get_user_by_name(search_name)
+                if user_found:
+                    await self.highrise.chat(f"✅ وجدت المستخدم:\n📝 الاسم: @{user_found.username}\n🆔 المعرف: {user_found.id}")
+                else:
+                    await self.highrise.chat(f"❌ لم أجد مستخدم باسم: {search_name}")
+            else:
+                await self.highrise.send_whisper(user.id, "❌ مثال: بحث أحمد")
+            return
+        
+        elif command in ["احداثيات", "موقعي", "pos", "position", "coords"]:
+            try:
+                room_users = await self.highrise.get_room_users()
+                for u, pos in getattr(room_users, 'content', []):
+                    if u.id == user.id:
+                        position_info = f"""
+📍 إحداثياتك:
+━━━━━━━━━━━━━━━
+X: {pos.x}
+Y: {pos.y}
+Z: {pos.z}
+Facing: {pos.facing}
+━━━━━━━━━━━━━━━
+📋 للنسخ:
+Position({pos.x}, {pos.y}, {pos.z}, "{pos.facing}")
+"""
+                        await self.highrise.send_whisper(user.id, position_info)
+                        return
+                await self.highrise.send_whisper(user.id, "❌ لم أتمكن من إيجاد موقعك")
+            except Exception as e:
+                await self.highrise.send_whisper(user.id, f"❌ خطأ: {e}")
+            return
+        
+        # أوامر المالك فقط
+        if self.is_owner(user):
+            if command in ["هنا", "setbot", "set_bot"]:
+                try:
+                    room_users = await self.highrise.get_room_users()
+                    for u, pos in getattr(room_users, 'content', []):
+                        if u.id == user.id:
+                            self.bot_position = pos
+                            self.save_config()
+                            # Teleport bot to the new location immediately
+                            await self.highrise.teleport(self.highrise.my_id, self.bot_position)
+                            await self.highrise.chat(f"📍 تم تحديد موقع البوت الجديد هنا @{user.username} وتم نقله!")
+                            return
+                    await self.highrise.send_whisper(user.id, "❌ لم أتمكن من العثور على موقعك لتحديد مكان البوت")
+                except Exception as e:
+                    print(f"Error in setbot command: {e}")
+                    await self.highrise.send_whisper(user.id, f"❌ خطأ: {e}")
+                return
+            
+            if command in ["addowner", "اضافة_مالك"]:
+                if len(parts) >= 2:
+                    new_owner = parts[1]
+                    if new_owner.startswith("@"):
+                        new_owner = new_owner[1:]
+                    if new_owner.lower() not in [o.lower() for o in self.owners]:
+                        self.owners.append(new_owner)
+                        self.save_config()
+                        await self.highrise.chat(f"👑 تم إضافة @{new_owner} كمالك جديد")
+                    else:
+                        await self.highrise.send_whisper(user.id, "❌ هذا المستخدم مالك بالفعل")
+                else:
+                    await self.highrise.send_whisper(user.id, "❌ مثال: اضافة_مالك أحمد")
+                return
+            
+            elif command in ["removeowner", "ازالة_مالك"]:
+                if len(parts) >= 2:
+                    old_owner = parts[1].lower()
+                    if old_owner.startswith("@"):
+                        old_owner = old_owner[1:]
+                    original_owner = next((o for o in self.owners if o.lower() == old_owner), None)
+                    if original_owner:
+                        if len(self.owners) > 1:
+                            self.owners.remove(original_owner)
+                            self.save_config()
+                            await self.highrise.chat(f"👑 تم إزالة @{old_owner} من قائمة الملاك")
+                        else:
+                            await self.highrise.send_whisper(user.id, "❌ لا يمكنك إزالة المالك الوحيد المتبقي!")
+                    else:
+                        await self.highrise.send_whisper(user.id, "❌ هذا المستخدم ليس مالكاً")
+                else:
+                    await self.highrise.send_whisper(user.id, "❌ مثال: ازالة_مالك أحمد")
+                return
+            
+            elif command in ["owners", "الملاك"]:
+                await self.highrise.chat(f"👑 الملاك الحاليين: {', '.join(self.owners)}")
+                return
+            
+            elif command in ["reset", "ريست", "إعادة_تشغيل"]:
+                self.muted_users.clear()
+                self.frozen_users.clear()
+                self.warned_users.clear()
+                self.user_messages.clear()
+                for user_id in list(self.dancing_users.keys()):
+                    self.dancing_users[user_id].cancel()
+                self.dancing_users.clear()
+                await self.highrise.chat("🔄 تم إعادة تشغيل البوت ومسح جميع البيانات")
+                return
+
+    async def show_help(self, user: User):
+        """عرض قائمة مساعدة روم المنتجع"""
+        is_admin = await self.is_admin(user)
+        is_owner = self.is_owner(user)
+        
+        help_msg = """🌿 روم المنتجع - قائمة الأوامر ✨
+━━━━━━━━━━━━━━
+📌 أوامر عامة:
+help - المساعدة
+users - المتواجدين
+floors - استعراض الطوابق
+رقصات - كيفية الرقص
+0 - إيقاف الرقص
+
+🏢 التنقل السريع:
+ارضي / فوق / فوق2 / vip
+        """
+        await self.highrise.send_whisper(user.id, help_msg)
+        await asyncio.sleep(0.5)
+
+        interact_msg = """🌿 تفاعلات المنتجع (الأمر اسم_الشخص):
+قلب، كف، حضن، بوس، لكم، ركل
+ضحك، غزل، كفك، احترام، زواج
+طيران، تليبورت، قيتار، انمي
+        """
+        await self.highrise.send_whisper(user.id, interact_msg)
+
+        if is_admin:
+            await asyncio.sleep(0.5)
+            admin_msg = """🛡️ لوحة تحكم المشرفين:
+طرد / كتم / حظر / تحذير <اسم>
+جلب / br / روح <اسم> (انتقال)
+تجميد / فك <اسم>
+إعلان <رسالة> | مسح (تنظيف)
+ر - قلوب للكل
+            """
+            await self.highrise.send_whisper(user.id, admin_msg)
+            
+        if is_owner:
+            await asyncio.sleep(0.5)
+            owner_msg = """👑 صلاحيات المالك:
+اضف_مشرف / ازل_مشرف
+اضافة_مالك / ريست / setbot
+فلوس (عرض الجولد) | تميز <اسم>
+            """
+            await self.highrise.send_whisper(user.id, owner_msg)
+
+    async def is_admin(self, user: User) -> bool:
+        """التحقق من صلاحيات المشرف"""
+        if user.username.lower() in [o.lower() for o in self.owners]:
+            return True
+        
+        if user.username.lower() in [a.lower() for a in self.admins if a]:
+            return True
+        
+        try:
+            permissions = await self.highrise.get_room_privilege(user.id)
+            if not isinstance(permissions, Exception):
+                return permissions.moderator or permissions.designer
+        except:
+            pass
+        
+        return False
+    
+    def is_owner(self, user: User) -> bool:
+        """التحقق من المالك"""
+        return user.username.lower() in [o.lower() for o in self.owners]
+
+    async def get_user_by_name(self, username: str) -> User | None:
+        """الحصول على مستخدم من اسمه"""
+        try:
+            room_users = await self.highrise.get_room_users()
+            username_clean = username.strip()
+            if username_clean.startswith('@'):
+                username_clean = username_clean[1:]
+            username_lower = username_clean.lower()
+            
+            for user, _ in getattr(room_users, 'content', []):
+                if user.username.lower() == username_lower:
+                    return user
+            
+            for user, _ in getattr(room_users, 'content', []):
+                if username_lower in user.username.lower():
+                    return user
+                    
+        except Exception as e:
+            print(f"Error searching for user: {e}")
+        
+        return None
+
+    async def kick_user(self, username: str, admin_user: User):
+        """طرد مستخدم"""
+        user = await self.get_user_by_name(username)
+        if user:
+            if user.username.lower() in [o.lower() for o in self.owners]:
+                await self.highrise.chat(f"👑 لا يمكن طرد المالك!")
+                return
+            
+            # منع المشرفين من طرد بعضهم البعض
+            is_target_admin = await self.is_admin(user)
+            is_admin_user = await self.is_admin(admin_user)
+            if is_target_admin and not self.is_owner(admin_user):
+                await self.highrise.chat(f"🛡️ لا يمكن طرد مشرف آخر! فقط الملاك يمكنهم فعل ذلك.")
+                return
+            
+            try:
+                await self.highrise.moderate_room(user.id, "kick")
+                await self.highrise.chat(f"👢 تم طرد {user.username}")
+            except Exception as e:
+                await self.highrise.chat(f"❌ خطأ: {e}")
+        else:
+            await self.highrise.chat(f"❌ لم يتم العثور على: {username}")
+
+    async def ban_user(self, username: str, duration: int):
+        """حظر مستخدم"""
+        user = await self.get_user_by_name(username)
+        if user:
+            if user.username.lower() in [o.lower() for o in self.owners]:
+                await self.highrise.chat(f"👑 لا يمكن حظر المالك!")
+                return
+            try:
+                await self.highrise.moderate_room(user.id, "ban", duration)
+                await self.highrise.chat(f"🔨 تم حظر {username} لمدة {duration} ثانية")
+            except Exception as e:
+                await self.highrise.chat(f"❌ خطأ: {e}")
+        else:
+            await self.highrise.chat(f"❌ لم يتم العثور على: {username}")
+
+    async def unban_user(self, username: str):
+        """فك حظر مستخدم"""
+        user = await self.get_user_by_name(username)
+        if user:
+            # ✅ لا يوجد إجراء "unban" في Highrise API
+            # الحظر ينتهي تلقائياً بعد انتهاء المدة المحددة
+            await self.highrise.chat(f"ℹ️ لا يمكن فك الحظر يدوياً - سينتهي تلقائياً. ({username})")
+        else:
+            await self.highrise.chat(f"❌ لم يتم العثور على: {username}")
+
+    async def mute_user(self, username: str, duration: int, admin_user: User = None):
+        """كتم مستخدم"""
+        user = await self.get_user_by_name(username)
+        if user:
+            if user.username.lower() in [o.lower() for o in self.owners]:
+                await self.highrise.chat(f"👑 لا يمكن كتم المالك!")
+                return
+            
+            # حماية المشرفين
+            is_target_admin = await self.is_admin(user)
+            if is_target_admin:
+                await self.highrise.chat(f"🛡️ لا يمكن كتم المشرفين!")
+                return
+            
+            try:
+                try:
+                    await self.highrise.moderate_room(user.id, "mute", duration)
+                    await self.highrise.chat(f"🔇 تم كتم {user.username} لمدة {duration} ثانية")
+                except:
+                    await self.highrise.chat(f"🔇 تم كتم {user.username} محلياً لمدة {duration} ثانية")
+                
+                # تخزين معرف المستخدم في قائمة المكتومين
+                self.muted_users[user.id] = True
+                await self.highrise.send_whisper(user.id, f"🔇 تم كتمك لمدة {duration} ثانية")
+                
+                # تشغيل مؤقت الكتم في الخلفية (بدون await) حتى يمكن فك الكتم يدوياً
+                async def auto_unmute():
+                    await asyncio.sleep(duration)
+                    if user.id in self.muted_users:
+                        del self.muted_users[user.id]
+                        try:
+                            await self.highrise.chat(f"🔊 انتهى كتم {user.username} تلقائياً")
+                        except:
+                            pass
+                
+                asyncio.create_task(auto_unmute())
+                
+            except Exception as e:
+                await self.highrise.chat(f"❌ خطأ: {e}")
+        else:
+            await self.highrise.chat(f"❌ لم يتم العثور على: {username}")
+
+    async def unmute_user(self, username: str):
+        """فك كتم مستخدم"""
+        user = await self.get_user_by_name(username)
+        if user:
+            if user.username.lower() in [o.lower() for o in self.owners]:
+                await self.highrise.chat(f"👑 لا يمكن حظر المالك!")
+                return
+            
+            # حماية المشرفين
+            is_target_admin = await self.is_admin(user)
+            if is_target_admin:
+                await self.highrise.chat(f"🛡️ لا يمكن حظر المشرفين!")
+                return
+            try:
+                # حذف المستخدم من قائمة المكتومين
+                if user.id in self.muted_users:
+                    del self.muted_users[user.id]
+                    await self.highrise.chat(f"🔊 تم فك كتم {user.username}")
+                else:
+                    await self.highrise.chat(f"ℹ️ {user.username} غير مكتوم")
+                    
+            except Exception as e:
+                print(f"General error in unmute: {e}")
+                try:
+                    await self.highrise.chat(f"✅ تم محاولة فك كتم {username}")
+                except:
+                    pass
+        else:
+            await self.highrise.chat(f"❌ لم يتم العثور على: {username}")
+
+    async def warn_user(self, user: User, reason: str):
+        """تحذير مستخدم"""
+        if user.id not in self.warned_users:
+            self.warned_users[user.id] = 0
+        
+        self.warned_users[user.id] += 1
+        warns = self.warned_users[user.id]
+        
+        await self.highrise.send_whisper(user.id, f"⚠️ تحذير ({warns}/3): {reason}")
+        await self.highrise.chat(f"⚠️ تم تحذير {user.username} - السبب: {reason}")
+        
+        if warns >= 3:
+            await self.highrise.chat(f"🔨 تم حظر {user.username} بسبب تجاوز التحذيرات")
+            await self.highrise.moderate_room(user.id, "kick")
+            del self.warned_users[user.id]
+
+    async def list_users(self):
+        """عرض قائمة المستخدمين"""
+        try:
+            room_users = await self.highrise.get_room_users()
+            
+            if getattr(room_users, 'content', []):
+                user_list = []
+                for i, (user, _) in enumerate(getattr(room_users, 'content', []), 1):
+                    user_list.append(f"{i}. @{user.username}")
+                
+                users_str = "\n".join(user_list)
+                await self.highrise.chat(f"👥 المستخدمين ({len(user_list)}):\n{users_str}")
+            else:
+                await self.highrise.chat("لا يوجد مستخدمين في الغرفة")
+        except Exception as e:
+            await self.highrise.chat(f"❌ خطأ: {e}")
+
+    async def check_spam(self, user: User) -> bool:
+        """فحص السبام"""
+        import time
+        
+        if user.id not in self.user_messages:
+            self.user_messages[user.id] = []
+        
+        current_time = time.time()
+        self.user_messages[user.id].append(current_time)
+        
+        self.user_messages[user.id] = [
+            t for t in self.user_messages[user.id] 
+            if current_time - t < 10
+        ]
+        
+        return len(self.user_messages[user.id]) > 5
+    
+    async def freeze_user(self, username: str):
+        """تجميد مستخدم"""
+        user = await self.get_user_by_name(username)
+        if user:
+            if user.username.lower() in [o.lower() for o in self.owners]:
+                await self.highrise.chat(f"👑 لا يمكن تجميد المالك!")
+                return
+            
+            try:
+                room_users = await self.highrise.get_room_users()
+                for u, pos in getattr(room_users, 'content', []):
+                    if u.id == user.id:
+                        self.frozen_users[user.id] = pos
+                        await self.highrise.chat(f"🧊 تم تجميد {user.username}")
+                        await self.highrise.send_whisper(user.id, "⚠️ تم تجميدك!")
+                        return
+                await self.highrise.chat(f"❌ لم يتم العثور على موقع {user.username}")
+            except Exception as e:
+                await self.highrise.chat(f"❌ خطأ: {e}")
+        else:
+            await self.highrise.chat(f"❌ لم يتم العثور على: {username}")
+    
+    async def unfreeze_user(self, username: str):
+        """فك تجميد مستخدم"""
+        user = await self.get_user_by_name(username)
+        if user:
+            if user.id in self.frozen_users:
+                del self.frozen_users[user.id]
+                await self.highrise.chat(f"✅ تم فك تجميد {username}")
+                await self.highrise.send_whisper(user.id, "✅ تم فك تجميدك!")
+            else:
+                await self.highrise.chat(f"❌ {username} غير مجمد")
+        else:
+            await self.highrise.chat(f"❌ لم يتم العثور على: {username}")
+
+    async def on_tip(self, sender: User, receiver: User, tip: CurrencyItem | Item) -> None:
+        """عند استلام إكرامية"""
+        try:
+            # تسجيل المستخدم في سجل التفاعلات (للـ invite)
+            self.interaction_history.add((sender.id, sender.username))
+            
+            if isinstance(tip, Item):
+                if tip.amount > 1:
+                    item_str = f"{tip.amount}x {tip.id}"
+                else:
+                    item_str = tip.id
+                await self.highrise.chat(f"🎁 شكراً {sender.username} على الهدية الرائعة ({item_str})! 🙏 😍")
+                
+            elif isinstance(tip, CurrencyItem):
+                await self.highrise.chat(f"💰 شكراً {sender.username} على {tip.amount} {tip.type}! أنت كريم جداً 🙏")
+                
+        except Exception as e:
+            print(f"Error processing tip: {e}")
+
+    async def on_whisper(self, user: User, message: str) -> None:
+        """عند استلام رسالة خاصة"""
+        try:
+            self.interaction_history.add((user.id, user.username))
+            print(f"Whisper from {user.username}: {message}")
+            await self.handle_command(user, message)
+        except Exception as e:
+            print(f"Error in on_whisper: {e}")
+
+    async def tip_user(self, sender: User, parts: list):
+        """💰 نظام توزيع الجولد"""
+        try:
+            if len(parts) < 3:
+                await self.safe_whisper(sender.id, "❌ مثال:\ntip اسم 100\ntip 5 50\ntip all 10")
+                return
+
+            if parts[1].lower() == "all":
+                amount = int(parts[2])
+                room_users = await self.highrise.get_room_users()
+                count = 0
+                await self.safe_chat(f"💵 جاري توزيع {amount} جولد على الجميع...")
+                for u, _ in getattr(room_users, 'content', []):
+                    if u.id != self.highrise.my_id:
+                        try:
+                            await self.highrise.tip_user_in_room(u.id, amount)
+                            count += 1
+                            await asyncio.sleep(0.5)
+                        except Exception as e:
+                            print(f"Tip error for {u.username}: {e}")
+                await self.safe_chat(f"✅ تم توزيع {amount} جولد على {count} شخص!")
+                return
+
+            try:
+                count_target = int(parts[1])
+                amount = int(parts[2])
+                room_users = await self.highrise.get_room_users()
+                users_list = [u for u, _ in getattr(room_users, 'content', []) if u.id != self.highrise.my_id]
+                import random
+                selected = random.sample(users_list, min(count_target, len(users_list)))
+                await self.safe_chat(f"💵 جاري إعطاء {amount} جولد لـ {len(selected)} أشخاص عشوائيين...")
+                for u in selected:
+                    try:
+                        await self.highrise.tip_user_in_room(u.id, amount)
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        print(f"Tip error: {e}")
+                names = "، ".join([u.username for u in selected[:5]])
+                await self.safe_chat(f"✅ تم إعطاء {amount} جولد لـ: {names}{'...' if len(selected) > 5 else ''}")
+                return
+            except ValueError:
+                pass
+
+            target_name = parts[1]
+            amount = int(parts[2])
+            target_user = await self.get_user_by_name(target_name)
+            if target_user:
+                await self.highrise.tip_user_in_room(target_user.id, amount)
+                await self.safe_chat(f"💵 تم إعطاء {amount} جولد لـ @{target_user.username}!")
+            else:
+                await self.safe_whisper(sender.id, f"❌ لم يتم العثور على: {target_name}")
+
+        except ValueError:
+            await self.safe_whisper(sender.id, "❌ الرقم غير صحيح")
+        except Exception as e:
+            await self.safe_whisper(sender.id, f"❌ خطأ: {e}")
+
+    async def send_invites(self, sender: User, custom_message: str = ""):
+        """📨 إرسال دعوات للمتفاعلين"""
+        try:
+            if not self.interaction_history:
+                await self.safe_whisper(sender.id, "❌ لا يوجد أشخاص في سجل التفاعلات بعد")
+                return
+            invite_msg = custom_message if custom_message else "🌟 مرحباً! البوت يدعوك للانضمام إلى الروم!"
+            await self.safe_whisper(sender.id, f"📨 جاري إرسال دعوات لـ {len(self.interaction_history)} شخص...")
+            sent = 0
+            for user_id, username in list(self.interaction_history):
+                try:
+                    await self.highrise.send_whisper(user_id, invite_msg)
+                    sent += 1
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    print(f"Invite error for {username}: {e}")
+            await self.safe_whisper(sender.id, f"✅ تم إرسال الدعوة لـ {sent} شخص!")
+        except Exception as e:
+            await self.safe_whisper(sender.id, f"❌ خطأ: {e}")
+
+    async def equip_bot_from_user(self, sender: User, target_username: str):
+        """👗 نسخ ملابس مستخدم آخر"""
+        try:
+            target_user = await self.get_user_by_name(target_username)
+            if not target_user:
+                await self.safe_whisper(sender.id, f"❌ لم يتم العثور على: {target_username}")
+                return
+            await self.safe_whisper(sender.id, f"👗 جاري نسخ ملابس {target_user.username}...")
+            user_outfit = await self.highrise.get_user_outfit(target_user.id)
+            if user_outfit and hasattr(user_outfit, 'outfit'):
+                await self.highrise.set_outfit(user_outfit.outfit)
+                await self.safe_chat(f"👗 البوت يرتدي الآن ملابس {target_user.username}!")
+            else:
+                await self.safe_whisper(sender.id, "❌ لم أتمكن من جلب ملابس هذا المستخدم")
+        except Exception as e:
+            await self.safe_whisper(sender.id, f"❌ خطأ: {e}")
+
+    async def switch_positions(self, requester: User, target_username: str):
+        """🔄 تبديل موقع المشرف مع مستخدم"""
+        try:
+            target_user = await self.get_user_by_name(target_username)
+            if not target_user:
+                await self.safe_whisper(requester.id, f"❌ لم يتم العثور على: {target_username}")
+                return
+            # حماية الملاك والمشرفين
+            is_target_owner = self.is_owner(target_user)
+            is_target_admin = await self.is_admin(target_user)
+            is_requester_owner = self.is_owner(requester)
+            
+            if (is_target_owner or is_target_admin) and not is_requester_owner:
+                await self.safe_whisper(requester.id, f"🛡️ لا يمكنك تبديل الموقع مع الملاك أو المشرفين!")
+                return
+
+            room_users = await self.highrise.get_room_users()
+            req_pos = next((pos for u, pos in getattr(room_users, 'content', []) if u.id == requester.id), None)
+            target_pos = next((pos for u, pos in getattr(room_users, 'content', []) if u.id == target_user.id), None)
+            if req_pos and target_pos and isinstance(req_pos, Position) and isinstance(target_pos, Position):
+                await asyncio.gather(
+                    self.highrise.teleport(requester.id, target_pos),
+                    self.highrise.teleport(target_user.id, req_pos)
+                )
+                await self.safe_chat(f"🔄 تم تبديل موقع {requester.username} مع {target_user.username}!")
+            else:
+                await self.safe_whisper(requester.id, "❌ لم أتمكن من جلب المواقع")
+        except Exception as e:
+            await self.safe_whisper(requester.id, f"❌ خطأ: {e}")
+
+    async def move_users(self, requester: User, user1_name: str, user2_name: str):
+        """🔄 تبديل مواقع مستخدمين"""
+        try:
+            user1 = await self.get_user_by_name(user1_name)
+            user2 = await self.get_user_by_name(user2_name)
+            if not user1 or not user2:
+                await self.safe_whisper(requester.id, "❌ لم يتم العثور على أحد المستخدمين")
+                return
+            # حماية الملاك والمشرفين
+            is_u1_protected = self.is_owner(user1) or await self.is_admin(user1)
+            is_u2_protected = self.is_owner(user2) or await self.is_admin(user2)
+            is_requester_owner = self.is_owner(requester)
+            
+            if (is_u1_protected or is_u2_protected) and not is_requester_owner:
+                await self.safe_whisper(requester.id, "🛡️ لا يمكنك نقل الملاك أو المشرفين!")
+                return
+
+            room_users = await self.highrise.get_room_users()
+            pos1 = next((pos for u, pos in getattr(room_users, 'content', []) if u.id == user1.id), None)
+            pos2 = next((pos for u, pos in getattr(room_users, 'content', []) if u.id == user2.id), None)
+            if pos1 and pos2 and isinstance(pos1, Position) and isinstance(pos2, Position):
+                await asyncio.gather(
+                    self.highrise.teleport(user1.id, pos2),
+                    self.highrise.teleport(user2.id, pos1)
+                )
+                await self.safe_chat(f"🔄 تم تبديل موقع {user1.username} مع {user2.username}!")
+            else:
+                await self.safe_whisper(requester.id, "❌ لم أتمكن من جلب المواقع")
+        except Exception as e:
+            await self.safe_whisper(requester.id, f"❌ خطأ: {e}")
+
+
+
 if __name__ == "__main__":
-    w = 60
-    print("\n" + "═"*w)
-    print("  🎙️  Highrise Radio Bot v11 — GitHub Storage Edition")
-    print("  خفيف • قوي • مجاني • بيانات محفوظة على GitHub")
-    print("═"*w)
-    print(f"  🔌  PORT      : {STREAM_PORT}")
-    print(f"  📻  /stream   : رابط البث")
-    print(f"  🌐  /panel    : لوحة التحكم")
-    print(f"  ❤️   /health   : Render Health Check")
-    print(f"  👤  المالك    : {OWNER}")
-    print(f"  🐙  GitHub    : {GITHUB_REPO or '❌ غير مفعّل'}")
-    print(f"  💾  Ring      : {RING_MB}MB = {MAX_LISTENERS:,} مستمع")
-    print("═"*w + "\n")
+    ROOM_ID = "695f30ddb10ff02e8ba0df4b"
+    TOKEN = "007243ed44a910c0913006a6f206babde6d4dc1c2a68915d916a66b7f112f9fb"
+    
+    async def run_forever():
+        while True:
+            try:
+                definitions = [BotDefinition(MyBot(), ROOM_ID, TOKEN)]
+                await main(definitions)
+            except Exception as e:
+                print(f"Bot error: {e}. Restarting in 5s...")
+                await asyncio.sleep(5)
 
     try:
-        asyncio.run(_main())
+        asyncio.run(run_forever())
     except KeyboardInterrupt:
-        print("\n👋 تم الإيقاف.")
+        pass

@@ -504,11 +504,11 @@ class MyBot(BaseBot):
             print("💓 Keep-Alive started")
 
     async def _keep_alive_loop(self):
-        """💓 Keep-Alive داخلي خفيف - يمنع Render من إيقاف البوت"""
+        """💓 Keep-Alive داخلي - يمنع Render من إيقاف البوت"""
         print("💓 Keep-Alive loop running...")
         while True:
             try:
-                await asyncio.sleep(10 * 60)  # كل 10 دقائق
+                await asyncio.sleep(10 * 60)
                 import datetime
                 print(f"💓 Keep-Alive | {datetime.datetime.now().strftime('%H:%M:%S')}")
             except asyncio.CancelledError:
@@ -2522,7 +2522,30 @@ floors - استعراض الطوابق
 if __name__ == "__main__":
     ROOM_ID = "695f30ddb10ff02e8ba0df4b"
     TOKEN = "007243ed44a910c0913006a6f206babde6d4dc1c2a68915d916a66b7f112f9fb"
-    
+
+    # ✅ HTTP Server لـ Render Web Service
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Bot is running!")
+        def log_message(self, *args):
+            pass  # اخفاء لوقات HTTP
+
+    def run_http_server():
+        port = int(os.environ.get("PORT", 10000))
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        print(f"✅ HTTP server running on port {port}")
+        server.serve_forever()
+
+    # تشغيل HTTP server في thread منفصل
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    http_thread.start()
+
     async def run_forever():
         while True:
             try:

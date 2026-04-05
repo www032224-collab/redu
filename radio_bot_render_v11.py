@@ -2521,41 +2521,43 @@ floors - استعراض الطوابق
 
 if __name__ == "__main__":
     ROOM_ID = "695f30ddb10ff02e8ba0df4b"
-    TOKEN = "007243ed44a910c0913006a6f206babde6d4dc1c2a68915d916a66b7f112f9fb"
+    TOKEN   = "007243ed44a910c0913006a6f206babde6d4dc1c2a68915d916a66b7f112f9fb"
 
-    # ✅ HTTP Server لـ Render Web Service
-    import threading
-    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import aiohttp
+    from aiohttp import web
 
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Bot is running!")
-        def log_message(self, *args):
-            pass  # اخفاء لوقات HTTP
+    async def _main():
+        # ① HTTP Server أولاً — Render يحتاجه قبل البوت
+        app = web.Application()
 
-    def run_http_server():
+        async def health(r):
+            return web.Response(text="OK ✅")
+
+        async def home(r):
+            return web.Response(text="🤖 Bot is running!")
+
+        app.router.add_get("/health", health)
+        app.router.add_get("/",       home)
+
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
         port = int(os.environ.get("PORT", 10000))
-        server = HTTPServer(("0.0.0.0", port), HealthHandler)
-        print(f"✅ HTTP server running on port {port}")
-        server.serve_forever()
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        print(f"✅ HTTP Server على port {port}")
 
-    # تشغيل HTTP server في thread منفصل
-    http_thread = threading.Thread(target=run_http_server, daemon=True)
-    http_thread.start()
-
-    async def run_forever():
+        # ② البوت — في نفس الـ event loop
+        backoff = 5
         while True:
             try:
-                definitions = [BotDefinition(MyBot(), ROOM_ID, TOKEN)]
-                await main(definitions)
+                print("🔌 جاري الاتصال بـ Highrise...")
+                await main([BotDefinition(MyBot(), ROOM_ID, TOKEN)])
+                backoff = 5
             except Exception as e:
-                print(f"Bot error: {e}. Restarting in 5s...")
-                await asyncio.sleep(5)
+                print(f"❌ Bot error: {e} — إعادة خلال {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     try:
-        asyncio.run(run_forever())
+        asyncio.run(_main())
     except KeyboardInterrupt:
-        pass
+        print("👋 تم الإيقاف.")

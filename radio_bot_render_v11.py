@@ -430,12 +430,16 @@ class MyBot(BaseBot):
         except: pass
 
     async def on_start(self, session_metadata: SessionMetadata):
-        """نقطة البدء — بسيطة ونظيفة بدون retry loops"""
-        print(f"✅ Bot connected: {session_metadata.user_id}")
+        """
+        on_start — يُشغَّل عند الاتصال الناجح بـ WebSocket
+        قاعدة ذهبية: لا تضع أي API calls هنا مباشرة
+        استخدم asyncio.create_task لكل شيء
+        """
+        print(f"✅ Connected | Bot: {session_metadata.user_id}")
         print(f"📍 Room: {session_metadata.room_info.room_name}")
 
-        # إلغاء أي مهام قديمة بأمان
-        for attr in ['bot_dance_task', '_keepalive_task']:
+        # إلغاء tasks القديمة بأمان
+        for attr in ['bot_dance_task', '_keepalive_task', '_init_task']:
             t = getattr(self, attr, None)
             if t and not t.done():
                 try: t.cancel()
@@ -445,43 +449,59 @@ class MyBot(BaseBot):
         self.connection_active = True
         self.bot_dancing = False
 
-        # انتظر 3 ثواني لاستقرار الاتصال
-        await asyncio.sleep(3)
+        # ✅ الحل الذهبي: كل شيء في task منفصل
+        # on_start يرجع فوراً — لا يعيق الـ WebSocket handshake
+        self._init_task = asyncio.create_task(self._initialize())
 
-        # نقل البوت — مرة واحدة فقط بدون retry
+    async def _initialize(self):
+        """تهيئة البوت بعد الاتصال — في task منفصل"""
         try:
-            await self.highrise.teleport(session_metadata.user_id, self.bot_position)
-            print("✅ Bot moved to position")
+            # انتظر 5 ثواني لاستقرار الاتصال تماماً
+            await asyncio.sleep(5)
+
+            # نقل البوت
+            try:
+                await self.highrise.teleport(
+                    self.highrise.my_id, self.bot_position)
+                print("✅ Bot moved")
+            except Exception as e:
+                print(f"⚠️ Move: {e}")
+
+            await asyncio.sleep(1)
+
+            # الملابس
+            try:
+                outfit = [
+                    Item(type="clothing", amount=1, id="body-flesh", active_palette=1),
+                    Item(type="clothing", amount=1, id="hair_front-n_animecollection2018coolguyhair", active_palette=6),
+                    Item(type="clothing", amount=1, id="hair_back-n_animecollection2018coolguyhair", active_palette=6),
+                    Item(type="clothing", amount=1, id="eye-n_animecollection2018bishoneneyes"),
+                    Item(type="clothing", amount=1, id="eyebrow-n_08"),
+                    Item(type="clothing", amount=1, id="nose-n_01"),
+                    Item(type="clothing", amount=1, id="mouth-n_01"),
+                    Item(type="clothing", amount=1, id="fullsuit-n_eastershop2021overalls"),
+                    Item(type="clothing", amount=1, id="handbag-n_MothersDay2018bouquet"),
+                    Item(type="clothing", amount=1, id="sock-n_seasonpass2026set3socks"),
+                    Item(type="clothing", amount=1, id="shoes-n_swimwear2018whiteslides"),
+                ]
+                await self.highrise.set_outfit(outfit)
+                print("✅ Outfit set")
+            except Exception as e:
+                print(f"⚠️ Outfit: {e}")
+
+            # الرقص
+            self.bot_dancing = True
+            self.bot_dance_task = asyncio.create_task(self.bot_auto_dance())
+
+            # Keep-Alive
+            self._keepalive_task = asyncio.create_task(self._keep_alive_loop())
+
+            print("🚀 Bot fully ready!")
+
+        except asyncio.CancelledError:
+            print("⚠️ Init cancelled")
         except Exception as e:
-            print(f"⚠️ Move skipped: {e}")
-
-        # الملابس
-        try:
-            outfit = [
-                Item(type="clothing", amount=1, id="body-flesh", active_palette=1),
-                Item(type="clothing", amount=1, id="hair_front-n_animecollection2018coolguyhair", active_palette=6),
-                Item(type="clothing", amount=1, id="hair_back-n_animecollection2018coolguyhair", active_palette=6),
-                Item(type="clothing", amount=1, id="eye-n_animecollection2018bishoneneyes"),
-                Item(type="clothing", amount=1, id="eyebrow-n_08"),
-                Item(type="clothing", amount=1, id="nose-n_01"),
-                Item(type="clothing", amount=1, id="mouth-n_01"),
-                Item(type="clothing", amount=1, id="fullsuit-n_eastershop2021overalls"),
-                Item(type="clothing", amount=1, id="handbag-n_MothersDay2018bouquet"),
-                Item(type="clothing", amount=1, id="sock-n_seasonpass2026set3socks"),
-                Item(type="clothing", amount=1, id="shoes-n_swimwear2018whiteslides"),
-            ]
-            await self.highrise.set_outfit(outfit)
-            print("✅ Outfit set")
-        except Exception as e:
-            print(f"⚠️ Outfit skipped: {e}")
-
-        # الرقص التلقائي
-        self.bot_dancing = True
-        self.bot_dance_task = asyncio.create_task(self.bot_auto_dance())
-
-        # Keep-Alive
-        self._keepalive_task = asyncio.create_task(self._keep_alive_loop())
-        print("🚀 Bot fully ready!")
+            print(f"❌ Init error: {e}")
 
     async def _keep_alive_loop(self):
         """💓 Keep-Alive — يمنع Render من إيقاف البوت"""
@@ -2507,34 +2527,24 @@ if __name__ == "__main__":
     PORT    = int(os.environ.get("PORT", 10000))
 
     async def _main():
-        # HTTP Server في نفس الـ loop — لا threading
+        # HTTP Server في نفس الـ loop
         app = web.Application()
         app.router.add_get("/health", lambda r: web.Response(text="OK"))
-        app.router.add_get("/",       lambda r: web.Response(text="Bot is alive!"))
+        app.router.add_get("/",       lambda r: web.Response(text="🤖 Bot Running!"))
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", PORT).start()
         print(f"✅ HTTP Server → port {PORT}")
 
-        backoff = 5
-        while True:
-            try:
-                print("🔌 جاري الاتصال...")
-                await main([BotDefinition(MyBot(), ROOM_ID, TOKEN)])
-                await asyncio.sleep(2)
-                backoff = 5
-            except Exception as e:
-                err = str(e)
-                print(f"❌ {err}")
-                if "multilogin" in err.lower() or "closing" in err.lower():
-                    print(f"⚠️ Multilogin — انتظار {backoff}s")
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff + 5, 30)
-                else:
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
+        # ✅ الحل الذكي: لا while True داخلياً
+        # Render يعيد تشغيل العملية كاملة عند الإغلاق
+        # هذا يضمن إغلاق الاتصال القديم 100% قبل الجديد
+        try:
+            print("🔌 Connecting to Highrise...")
+            await main([BotDefinition(MyBot(), ROOM_ID, TOKEN)])
+        except Exception as e:
+            print(f"❌ Bot stopped: {e}")
+        finally:
+            print("🔄 Process ending — Render will restart")
 
-    try:
-        asyncio.run(_main())
-    except KeyboardInterrupt:
-        print("👋 تم الإيقاف.")
+    asyncio.run(_main())
